@@ -127,6 +127,66 @@ const PEACHES_PER_DEPOSIT = 24;   // 8 peaches per point, 3 points max per depos
 const SCAN_RADIUS = 40;
 
 // ---------------------------------------------------------------------------
+// HUD / session stats
+// ---------------------------------------------------------------------------
+const ALCH_ITEM_NAMES = ["Boots", "Kiteshield", "Helm", "Emerald", "Longsword"];
+
+// NATURERUNE / LAWRUNE / COSMICRUNE
+const RUNE = Object.freeze({ NATURE: 561, LAW: 563, COSMIC: 564 });
+
+/** The rune each room's spell uses up, indexed by ROOM. */
+const ROOM_RUNES = [
+    { id: RUNE.LAW, name: "Law" },
+    { id: RUNE.NATURE, name: "Nature" },
+    { id: RUNE.COSMIC, name: "Cosmic" },
+    { id: RUNE.NATURE, name: "Nature" },
+];
+
+/** Items handed in for points in each room, indexed by ROOM. */
+const DEPOSIT_ITEMS = [null, [ITEM.MTA_COINS], [ITEM.ORB], [ITEM.BANANA, ITEM.PEACH]];
+const DEPOSIT_NAMES = ["", "coins", "orbs", "fruit"];
+
+const COLOR = Object.freeze({
+    ACCENT: 0xFF9B7BFF,
+    XP: 0xFF7FB2FF,
+    GOOD: 0xFF68CC92,
+    WARN: 0xFFFFD166,
+    BAD: 0xFFFF6B6B,
+    TEXT: 0xFFFFFFFF,
+    DIM: 0xFFA0A8B0,
+    BAR_BG: 0xFF24313A,
+});
+
+const TICKS_PER_HOUR = 6000;
+/** Hourly rates stay hidden until this much data (~30s) exists. */
+const RATE_MIN_TICKS = 50;
+/** A single points read jumping by more than this is a widget glitch, not a gain. */
+const MAX_POINT_STEP = 500;
+const EVENT_LOG_SIZE = 30;
+const HUD_STATUS_CHARS = 34;
+
+/** ImGuiTableColumnFlags (Dear ImGui 1.92, as embedded in the client) for panel.tableSetupColumn. */
+const IMGUI_COLUMN = Object.freeze({ WIDTH_STRETCH: 1 << 3, WIDTH_FIXED: 1 << 4 });
+/** Pixels for side-panel value columns; fits "12h 30m" and "1,234,567". */
+const VALUE_COLUMN_WIDTH = 72;
+
+// ---------------------------------------------------------------------------
+// Error log
+// ---------------------------------------------------------------------------
+/** Actions kept for context in each error report. */
+const CRUMB_LIMIT = 15;
+const REPORT_LIMIT = 10;
+/** The same action failing this many times in a row is reported. */
+const FAIL_STREAK_LIMIT = 3;
+const REPORT_KINDS = {
+    error: { label: "Script error", tone: 4, color: COLOR.BAD },
+    stop: { label: "Stopped", tone: 4, color: COLOR.BAD },
+    stuck: { label: "No progress", tone: 3, color: COLOR.WARN },
+    failing: { label: "Action failing", tone: 3, color: COLOR.WARN },
+    warning: { label: "Warning", tone: 3, color: COLOR.WARN },
+};
+
+// ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
 function randInt(min, max) {
@@ -163,12 +223,59 @@ function chebyshev(a, b) {
     return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y));
 }
 
+/** Total experience needed for `level`. */
+function xpForLevel(level) {
+    let total = 0;
+    for (let current = 1; current < level; current++) {
+        total += Math.floor(current + 300 * Math.pow(2, current / 7));
+    }
+    return Math.floor(total / 4);
+}
+
+/** 1,240 / 45.2k / 1.23m */
+function formatShort(value) {
+    const n = Math.floor(value);
+    if (Math.abs(n) >= 1000000) return `${(n / 1000000).toFixed(2)}m`;
+    if (Math.abs(n) >= 10000) return `${(n / 1000).toFixed(1)}k`;
+    return n.toLocaleString();
+}
+
+/** 45s / 8m 20s / 2h 05m */
+function formatDuration(seconds) {
+    const total = Math.max(0, Math.floor(seconds));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+    if (minutes > 0) return `${minutes}m ${String(total % 60).padStart(2, "0")}s`;
+    return `${total}s`;
+}
+
+function formatTicks(ticks) {
+    return formatDuration(ticks * 0.6);
+}
+
+/** Local wall-clock time as HH:MM:SS. */
+function clockTime() {
+    const d = new Date();
+    return [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":");
+}
+
+function truncate(text, max) {
+    const s = String(text || "");
+    return s.length > max ? `${s.slice(0, max - 1)}.` : s;
+}
+
+function capitalize(text) {
+    const s = String(text || "");
+    return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
 class MageTrainingArenaPlugin extends titan.Plugin {
     id = "prof_mta";
     name = "[Prof] Mage Training Arena";
     description = "Runs the selected Mage Training Arena room for pizazz points.";
     author = "Prof";
-    version = "0.1.0";
+    version = "0.2.0";
 
     enabled = false;
 
@@ -176,26 +283,9 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         id: "main",
         title: "MTA",
         icon: "lucide:wand-sparkles",
-        iconColor: 0xFF9B7BFF,
-        build: (panel) => {
-            panel.separatorText(this.name)
-                .label("Status", this.running ? "Running" : "Stopped")
-                .button(this.running ? "Stop" : "Start", 1)
-                .spacing()
-                .label("State", this.status)
-                .label("Room", this.roomLabel())
-                .separatorText("Pizazz points");
-            ROOMS.forEach((room) => {
-                panel.label(ROOM_NAMES[room], `${this.pointsLabel(room)} / ${this.goalFor(room)}`);
-            });
-            panel.progress(this.totalProgress(), `${Math.floor(this.totalProgress() * 100)}% of goal`)
-                .spacing()
-                .button("Forget tracked points", 2);
-        },
-        onAction: (actionId) => {
-            if (actionId === 1) this.toggleAutomation();
-            if (actionId === 2) this.resetTrackedPoints();
-        },
+        iconColor: COLOR.ACCENT,
+        build: (panel) => this.buildSidePanel(panel),
+        onAction: (actionId) => this.onPanelAction(actionId),
     }];
 
     // ---- Settings -----------------------------------------------------------
@@ -209,6 +299,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     alchSection = this.createSection("alch", "Alchemists' Playground", { position: 3, closedByDefault: true });
     enchSection = this.createSection("ench", "Enchanting Chamber", { position: 4, closedByDefault: true });
     graveSection = this.createSection("grave", "Creature Graveyard", { position: 5, closedByDefault: true });
+    hudSection = this.createSection("hud", "HUD", { position: 6, closedByDefault: true });
 
     startStop = this.createSetting("buttonSetting", {
         key: "startStop",
@@ -386,35 +477,79 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         hidden: true,
     });
 
+    showHud = this.createSetting("boolSetting", {
+        key: "showHud",
+        name: "Show HUD",
+        section: this.hudSection,
+        position: 0,
+        default: true,
+    });
+
+    hudDetail = this.createSetting("comboSetting", {
+        key: "hudDetail",
+        name: "HUD layout",
+        section: this.hudSection,
+        position: 1,
+        default: 1,
+        choices: [{ value: 0, label: "Compact" }, { value: 1, label: "Detailed" }],
+        tooltip: "Compact shows state, XP/h and points/h. Detailed adds level progress, room details and supplies.",
+    });
+
+    hudShowGoals = this.createSetting("boolSetting", {
+        key: "hudShowGoals",
+        name: "Show all room goals",
+        section: this.hudSection,
+        position: 2,
+        default: true,
+    });
+
+    hudEventLines = this.createSetting("intSetting", {
+        key: "hudEventLines",
+        name: "Recent events shown",
+        section: this.hudSection,
+        position: 3,
+        default: 4,
+        min: 0,
+        max: 8,
+    });
+
+    stuckMinutes = this.createSetting("intSetting", {
+        key: "stuckMinutes",
+        name: "Report no progress after (min)",
+        section: this.hudSection,
+        position: 5,
+        default: 3,
+        min: 1,
+        max: 15,
+        tooltip: "Adds an error report when neither points nor Magic XP have gone up for this long.",
+    });
+
+    sceneLabels = this.createSetting("boolSetting", {
+        key: "sceneLabels",
+        name: "Label targets in the scene",
+        section: this.hudSection,
+        position: 4,
+        default: true,
+        tooltip: "Text over the stand tile, maze finish, cupboard contents and the shape pile being used.",
+    });
+
     statusPanel = this.createOverlayPanel({
         name: "status",
         anchor: titan.OverlayAnchor.TopCenter,
         priority: 50,
-        preferredWidth: 250,
-        render: (panel) => {
-            panel.title(this.name);
-            panel.line("State", this.status);
-            panel.line("Room", this.roomLabel());
-            ROOMS.forEach((room) => {
-                const done = this.goalReached(room);
-                panel.line(ROOM_NAMES[room], `${this.pointsLabel(room)} / ${this.goalFor(room)}`,
-                    0xFFFFFFFF, done ? 0xFF68CC92 : 0xFFFFFFFF);
-            });
-            panel.progressBar(Math.round(this.totalProgress() * 1000), 0, 1000, 0xFF9B7BFF, 0xFF24313A);
-            if (this.running) panel.line("Runtime", this.formatDuration((this.tick - this.startTick) * 0.6));
-        },
+        preferredWidth: 260,
+        render: (panel) => this.guardRender("HUD", () => this.renderHud(panel)),
     });
 
     sceneOverlay = this.createOverlay({
         layer: titan.OverlayLayer.ABOVE_SCENE,
-        render: () => this.renderScene(),
+        render: () => this.guardRender("scene overlay", () => this.renderScene()),
     });
 
     // ---- Runtime state ------------------------------------------------------
     running = false;
     status = "Stopped";
     tick = 0;
-    startTick = 0;
     sleepTicks = 0;
     currentRoom = null;
     targetRoom = null;
@@ -426,6 +561,15 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     alch = null;
     ench = null;
     grave = null;
+    session = this.newSession();
+    events = [];
+    crumbs = [];            // last CRUMB_LIMIT actions, newest last
+    reports = [];           // newest first
+    reportSeq = 0;
+    dismissedReport = 0;    // highest report id the player has dismissed
+    failStreak = { text: "", count: 0 };
+    stuckReported = false;
+    renderErrors = new Set();
 
     // ---- Setting helpers (tolerate hosts missing a helper, like stallThieving) ----
     createSection(key, name, opts) {
@@ -464,15 +608,21 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     toggleAutomation() {
         this.running = !this.running;
         this.resetState();
-        this.startTick = this.tick;
         this.status = this.running ? "Starting" : "Stopped";
-        this.log(this.running ? "started" : "stopped");
+        // Anything gained while stopped (manual play) isn't the script's doing.
+        if (this.running) this.rebaselineSession();
+        this.event(this.running ? "Started" : "Stopped by user", this.running ? COLOR.GOOD : COLOR.DIM);
+        this.crumb(this.running ? `Started (${this.roomLabelForMode()})` : "Stopped by user", "info");
     }
 
-    stop(reason) {
+    /** Stop the run. Pass `details` ({ why, fix }) when it stopped because something went wrong. */
+    stop(reason, details) {
+        // Report first so it captures what the script was doing, not the stop reason.
+        if (details) this.report("stop", `Stopped: ${reason}`, details.why, details.fix);
+        this.crumb(`Stopped: ${reason}`, "info");
         this.running = false;
         this.status = reason;
-        this.log(`stopped: ${reason}`);
+        this.event(`Stopped: ${reason}`, details ? COLOR.BAD : COLOR.GOOD);
     }
 
     resetState() {
@@ -486,7 +636,10 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     }
 
     resetRoomState() {
-        this.tele = { maze: null, dir: null, standTile: null, castFrom: null, lastTile: null, settledTick: 0 };
+        this.tele = {
+            maze: null, dir: null, standTile: null, castFrom: null, lastTile: null, settledTick: 0,
+            guardianTile: null, moves: null, solved: false,
+        };
         this.alch = {
             signature: "",
             costs: [-1, -1, -1, -1, -1],
@@ -501,7 +654,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             bestCupboard: null,
         };
         this.ench = { phase: "collect", bonus: null, spell: null, spellTick: -100, castSlot: -1, castItem: -1, pile: null };
-        this.grave = {};
+        this.grave = { fruitValue: 0, target: 0, bones: 0, peaches: false };
     }
 
     onGameTick(tick) {
@@ -513,20 +666,25 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             return;
         }
 
-        this.readPoints();
-        if (this.sleepTicks > 0) {
-            this.sleepTicks--;
-            return;
-        }
-
         try {
+            this.readPoints();
+            this.updateSession();
+            this.checkStuck();
+            if (this.sleepTicks > 0) {
+                this.sleepTicks--;
+                return;
+            }
             this.loop();
             this.errorCount = 0;
         } catch (error) {
             this.errorCount++;
-            this.log(`error: ${error && error.stack ? error.stack : error}`);
-            if (this.errorCount >= 10) this.stop("Stopped after repeated errors (see log)");
-            else this.wait(2, 3);
+            this.reportException(error);
+            if (this.errorCount >= 10) {
+                this.stop("Stopped after repeated errors", {
+                    why: "The same tick handler threw 10 times in a row, so the script gave up.",
+                    fix: "See the script error report below; use 'Write to client log' and send it in.",
+                });
+            } else this.wait(2, 3);
         }
     }
 
@@ -537,9 +695,17 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             this.alch.emptyTick = this.tick;
         } else if ((message.includes("do not have enough") || message.includes("don't have enough"))
             && message.includes("to cast")) {
-            this.stop(`Out of supplies: ${stripTags(event.message)}`);
+            this.stop("Out of supplies", {
+                why: `The game said: "${stripTags(event.message)}"`,
+                fix: "Restock the runes for this room (check the staff and rune pouch too), then start again.",
+            });
         } else if (message.includes("you need a magic level")) {
-            this.stop(stripTags(event.message));
+            this.stop("Magic level too low", {
+                why: `The game said: "${stripTags(event.message)}"`,
+                fix: "Pick a lower spell in the room's settings, or train Magic first.",
+            });
+        } else if (message.includes("can't reach") || message.includes("cannot reach")) {
+            this.crumb(`Game: ${stripTags(event.message)}`, "fail");
         }
     }
 
@@ -548,6 +714,8 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         const current = this.detectRoom();
         if (current !== this.currentRoom) {
             this.log(`room: ${this.roomName(this.currentRoom)} -> ${this.roomName(current)}`);
+            this.event(current === null ? `Left ${ROOM_NAMES[this.currentRoom]}` : `Entered ${ROOM_NAMES[current]}`);
+            this.crumb(current === null ? `Now in the lobby` : `Now in ${ROOM_NAMES[current]}`, "info");
             this.currentRoom = current;
             this.pending = null;
             this.resetRoomState();
@@ -660,17 +828,25 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         }
 
         if (this.guardianIs(guardian, NPC_ID.GUARDIAN_DONE) || guardian.hasAction("New-maze")) {
+            if (!t.solved) {
+                t.solved = true;
+                this.session.mazes++;
+                this.event(`Maze solved (#${this.session.mazes})`, COLOR.GOOD);
+            }
             this.status = "Maze solved - starting a new maze";
             if (this.interactPreferred(guardian, ["New-maze"])) {
                 t.maze = null;
                 t.standTile = null;
+                t.moves = null;
                 this.wait(3, 5);
             }
             return;
         }
+        t.solved = false;
 
         // The guardian slides a tile per tick; only plan from a tile it has settled on.
         const g = guardian.tile;
+        t.guardianTile = { x: g.x, y: g.y, plane: g.plane };
         if (tileKey(g) !== t.lastTile) {
             t.lastTile = tileKey(g);
             t.settledTick = this.tick;
@@ -700,12 +876,15 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         }
 
         if (g.x === t.maze.finish.x && g.y === t.maze.finish.y) {
+            t.moves = 0;
             this.status = "Guardian on the finish tile";
             return;
         }
 
-        const dir = this.solveMaze(t.maze, g);
+        const solution = this.solveMaze(t.maze, g);
+        const dir = solution ? solution.dir : null;
         t.dir = dir;
+        t.moves = solution ? solution.moves : null;
         if (!dir) {
             this.status = "No route found - resetting the maze";
             if (this.interactPreferred(guardian, ["Reset"])) {
@@ -731,14 +910,16 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             this.status = `Moving to the ${dir.name} side`;
             const walkKey = `tele-walk:${tileKey(t.standTile)}`;
             if (!this.inProgress(walkKey, tileKey(p), 3)) {
-                titan.state.walk.toScene(t.standTile.x, t.standTile.y);
+                this.action(`Walk to the ${dir.name} side`, titan.state.walk.toScene(t.standTile.x, t.standTile.y));
                 this.track(walkKey, tileKey(p));
             }
             return;
         }
 
         this.status = `Telegrabbing ${dir.name}`;
-        if (guardian.castOn(titan.utils.magic.Standard.TELEKINETIC_GRAB)) {
+        if (this.action(`Telekinetic Grab (${dir.name})`,
+            guardian.castOn(titan.utils.magic.Standard.TELEKINETIC_GRAB))) {
+            this.session.casts++;
             t.castFrom = tileKey(g);
             this.track("telegrab", t.castFrom);
             this.wait(1, 2);
@@ -804,23 +985,26 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         return { x, y };
     }
 
-    /** Breadth-first search over slides; returns the first direction of a shortest solution. */
+    /**
+     * Breadth-first search over slides. Returns the first direction of a
+     * shortest solution and its length in grabs, or null when unsolvable.
+     */
     solveMaze(maze, start) {
         const goal = `${maze.finish.x},${maze.finish.y}`;
         const startKey = `${start.x},${start.y}`;
-        const firstDir = new Map([[startKey, null]]);
+        const seen = new Map([[startKey, { first: null, depth: 0 }]]);
         const queue = [{ x: start.x, y: start.y }];
 
         while (queue.length > 0) {
             const node = queue.shift();
-            const nodeKey = `${node.x},${node.y}`;
+            const info = seen.get(`${node.x},${node.y}`);
             for (const dir of DIRS) {
                 const next = this.slide(maze, node.x, node.y, dir);
                 const nextKey = `${next.x},${next.y}`;
-                if (firstDir.has(nextKey)) continue;
-                const first = firstDir.get(nodeKey) || dir;
-                if (nextKey === goal) return first;
-                firstDir.set(nextKey, first);
+                if (seen.has(nextKey)) continue;
+                const step = { first: info.first || dir, depth: info.depth + 1 };
+                if (nextKey === goal) return { dir: step.first, moves: step.depth };
+                seen.set(nextKey, step);
                 queue.push(next);
             }
         }
@@ -898,7 +1082,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         });
         if (junk) {
             this.status = `Dropping ${junk.name}`;
-            junk.interact("Drop");
+            this.action(`Drop ${junk.name}`, junk.interact("Drop"));
             this.wait(0, 1);
             return;
         }
@@ -908,7 +1092,8 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         if (held.length > 0 && !a.pendingSearch && this.tick - a.lastAlchTick >= ALCH_COOLDOWN_TICKS) {
             const item = held.sort((l, r) => this.alchValue(r.id) - this.alchValue(l.id))[0];
             this.status = `Alching ${item.name} (${this.alchValue(item.id)} coins)`;
-            if (item.castOn(this.alchemySpell())) {
+            if (this.action(`Alch ${item.name}`, item.castOn(this.alchemySpell()))) {
+                this.session.casts++;
                 a.lastAlchTick = this.tick;
                 this.wait(0, 1);
             }
@@ -928,7 +1113,10 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         }
         if (inv.emptySlots === 0) {
             if (coins > 0) this.depositAlchemyCoins();
-            else this.stop("Inventory full - free some slots for alchemy items");
+            else this.stop("Inventory full - free some slots for alchemy items", {
+                why: "Every slot is taken and there are no coins to deposit, so no cupboard item can be taken.",
+                fix: "Free a few inventory slots and start again.",
+            });
             return;
         }
 
@@ -965,7 +1153,11 @@ class MageTrainingArenaPlugin extends titan.Plugin {
 
         const signature = costs.join(",");
         if (costs.some((cost) => cost >= 0) && signature !== a.signature) {
-            if (a.signature) this.log(`alchemy prices rotated: ${signature}`);
+            if (a.signature) {
+                this.log(`alchemy prices rotated: ${signature}`);
+                const best = costs.indexOf(Math.max(...costs));
+                this.event(`Prices rotated - best: ${ALCH_ITEM_NAMES[best]}`);
+            }
             a.signature = signature;
             a.observations = [];
             a.bestCupboard = null;
@@ -1120,7 +1312,12 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         const inv = titan.utils.inventory;
         const spell = this.enchantSpell();
         if (!spell) {
-            this.stop("No castable enchant spell (check level, runes and staff)");
+            this.stop("No castable enchant spell (check level, runes and staff)", {
+                why: this.enchantLevel.value > 0
+                    ? `Lvl-${this.enchantLevel.value} Enchant was chosen in settings but can't be resolved.`
+                    : "No Lvl-1..7 Enchant spell can be cast with the current level, runes and staff.",
+                fix: "Check cosmic runes plus the elemental runes/staff for the spell, or pick a lower spell.",
+            });
             return;
         }
         e.bonus = this.readBonusShape();
@@ -1130,7 +1327,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             if (dragonstone) {
                 this.status = "Picking up a dragonstone";
                 if (!this.inProgress("dragonstone", inv.size, 4)) {
-                    dragonstone.interact("Take");
+                    this.action("Take dragonstone", dragonstone.interact("Take"));
                     this.track("dragonstone", inv.size);
                 }
                 return;
@@ -1142,7 +1339,10 @@ class MageTrainingArenaPlugin extends titan.Plugin {
 
         if (e.phase === "collect" && inv.emptySlots === 0) {
             if (enchantable.length === 0 && orbs === 0) {
-                this.stop("Inventory full - free some slots for shapes");
+                this.stop("Inventory full - free some slots for shapes", {
+                    why: "Every slot is taken and none of it is a shape, dragonstone or orb.",
+                    fix: "Free inventory slots (only runes/staff are needed here) and start again.",
+                });
                 return;
             }
             e.phase = "enchant";
@@ -1159,7 +1359,8 @@ class MageTrainingArenaPlugin extends titan.Plugin {
                 }
                 const next = this.nextEnchantTarget(enchantable, e.bonus);
                 this.status = `Enchanting ${next.name}`;
-                if (next.castOn(spell)) {
+                if (this.action(`${spell.name || "Enchant"} on ${next.name}`, next.castOn(spell))) {
+                    this.session.casts++;
                     e.castSlot = next.slot;
                     e.castItem = next.id;
                     this.track("enchant", next.slot);
@@ -1261,11 +1462,16 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             const food = this.pickFood();
             if (food) {
                 this.status = `Eating ${food.name}`;
-                food.interact("Eat");
+                this.action(`Eat ${food.name}`, food.interact("Eat"));
+                this.session.eaten++;
+                this.session.lastEatTick = this.tick;
                 this.wait(2, 3);
                 return;
             }
-            this.warnOnce("grave-food", "HP is low and there is no food to eat");
+            this.warnOnce("grave-food", "HP is low and there is no food to eat",
+                `HP is ${hp}/${maxHp}, below the ${this.graveEatPercent.value}% eat threshold, `
+                + "and nothing in the inventory has an Eat option.",
+                "Bring food, or let the plugin keep some bananas/peaches by lowering the eat threshold.");
         }
 
         const bones = titan.queries.inventory().ids(...ITEM.BONES).toArray();
@@ -1273,6 +1479,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         const usePeaches = this.useBonesToPeaches();
         const capacity = inv.emptySlots + bones.length;
         const target = Math.min(usePeaches ? PEACHES_PER_DEPOSIT : capacity, capacity);
+        Object.assign(this.grave, { fruitValue, target, bones: bones.length, peaches: usePeaches });
 
         // Stop grabbing once another bone (worth up to 4 fruit) could overflow the inventory.
         if (bones.length > 0 && (fruitValue >= target || fruitValue + 4 > capacity || inv.emptySlots === 0)) {
@@ -1283,7 +1490,10 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             const spells = titan.utils.magic.Standard;
             const spell = usePeaches ? spells.BONES_TO_PEACHES : spells.BONES_TO_BANANAS;
             this.status = usePeaches ? "Casting Bones to Peaches" : "Casting Bones to Bananas";
-            if (titan.utils.magic.cast(spell)) this.track("bones-to-fruit", fruitValue);
+            if (this.action(spell.name || "Bones to fruit", titan.utils.magic.cast(spell))) {
+                this.session.casts++;
+                this.track("bones-to-fruit", fruitValue);
+            }
             return;
         }
 
@@ -1354,19 +1564,22 @@ class MageTrainingArenaPlugin extends titan.Plugin {
      */
     interactPreferred(entity, preferred) {
         if (!entity) return false;
+        const target = entity.name || "object";
         const actions = (entity.actions || []).filter((action) => action);
-        if (actions.length === 0) return entity.interact(preferred[0]);
+        if (actions.length === 0) return this.action(`${preferred[0]} ${target}`, entity.interact(preferred[0]));
 
         for (const want of preferred) {
             const match = actions.find((action) => action.toLowerCase() === want.toLowerCase());
-            if (match) return entity.interact(match);
+            if (match) return this.action(`${match} ${target}`, entity.interact(match));
         }
         for (const want of preferred) {
             const match = actions.find((action) => action.toLowerCase().includes(want.toLowerCase()));
-            if (match) return entity.interact(match);
+            if (match) return this.action(`${match} ${target}`, entity.interact(match));
         }
-        this.warnOnce(`actions:${entity.name}`,
-            `${entity.name} has no ${preferred.join("/")} action (has: ${actions.join(", ")})`);
+        this.action(`${preferred[0]} ${target} (option missing)`, false);
+        this.warnOnce(`actions:${target}`, `${target} has no "${preferred.join("/")}" option`,
+            `Its menu offers: ${actions.join(", ")}. The option name may differ in-game.`,
+            "Update the action name in profMTA.js (see 'Unverified in-game' in the README).");
         return false;
     }
 
@@ -1375,7 +1588,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         if (!isSet(point)) return false;
         const player = this.local();
         if (player && !player.isStationary) return true;
-        return titan.state.walk.toWorld(point.x, point.y, point.z);
+        return this.action(`Walk to ${point.x},${point.y}`, titan.state.walk.toWorld(point.x, point.y, point.z));
     }
 
     /** Start tracking an action whose effect shows up as a change in `value`. */
@@ -1423,7 +1636,9 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             if (this.isWidgetVisible(WIDGET.LOBBY_POINTS[room])) {
                 value = parseNumber(titan.state.widgets.find(WIDGET.LOBBY_POINTS[room]).text);
             }
-            if (value !== null && value !== this.points[room]) {
+            if (value === null) return;
+            this.notePoints(room, value);
+            if (value !== this.points[room]) {
                 this.points[room] = value;
                 changed = true;
             }
@@ -1466,21 +1681,771 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         return earned / goal;
     }
 
+    roomProgress(room) {
+        const goal = this.goalFor(room);
+        if (goal <= 0) return 1;
+        return clamp((this.points[room] || 0) / goal, 0, 1);
+    }
+
+    // ---- Session stats ------------------------------------------------------
+    /**
+     * Stats survive Stop/Start so a paused run keeps its rates; only ticks
+     * spent running count toward them. "Reset session" starts over.
+     */
+    newSession() {
+        return {
+            runTicks: 0,
+            travelTicks: 0,
+            roomTicks: [0, 0, 0, 0],
+            xpStart: null,
+            levelStart: null,
+            lastXp: null,
+            lastLevel: null,
+            xpGained: 0,
+            xpByRoom: [0, 0, 0, 0],
+            seen: [null, null, null, null],   // last points read while running
+            gained: [0, 0, 0, 0],
+            deposited: [0, 0, 0, 0],
+            depositRoom: null,
+            depositCount: null,
+            lastGainTick: null,
+            lastEatTick: -100,
+            mazes: 0,
+            casts: 0,
+            eaten: 0,
+        };
+    }
+
+    resetSession() {
+        this.session = this.newSession();
+        this.events = [];
+        this.event("Session stats reset");
+    }
+
+    /** Forget last-seen values so gains made while stopped aren't counted. */
+    rebaselineSession() {
+        const s = this.session;
+        s.lastXp = null;
+        s.seen = [null, null, null, null];
+        s.depositCount = null;
+        s.lastGainTick = this.tick;
+    }
+
+    /** Called every running tick: time per room, magic XP and deposits. */
+    updateSession() {
+        const s = this.session;
+        const room = this.currentRoom;
+        s.runTicks++;
+        if (room === null) s.travelTicks++;
+        else s.roomTicks[room]++;
+        if (s.lastGainTick === null) s.lastGainTick = this.tick;
+
+        const skills = titan.state.skills;
+        const xp = skills.experience(titan.Skill.MAGIC);
+        const level = skills.real(titan.Skill.MAGIC);
+        if (xp > 0) {
+            if (s.xpStart === null) {
+                s.xpStart = xp;
+                s.levelStart = level;
+                s.lastLevel = level;
+            }
+            if (s.lastXp !== null && xp > s.lastXp) {
+                const gain = xp - s.lastXp;
+                s.xpGained += gain;
+                if (room !== null) s.xpByRoom[room] += gain;
+                s.lastGainTick = this.tick;
+            }
+            s.lastXp = xp;
+            if (s.lastLevel !== null && level > s.lastLevel) {
+                this.event(`Magic level ${level}!`, COLOR.GOOD);
+            }
+            s.lastLevel = level;
+        }
+
+        // Deposits: the deposit item count dropping while a deposit is in progress.
+        const items = room === null ? null : DEPOSIT_ITEMS[room];
+        const count = items ? titan.utils.inventory.count(items) : 0;
+        const depositing = this.pending && this.pending.key.startsWith("deposit:");
+        const eating = this.tick - s.lastEatTick <= 3;
+        if (items && room === s.depositRoom && s.depositCount !== null && count < s.depositCount
+            && depositing && !eating) {
+            const amount = s.depositCount - count;
+            s.deposited[room] += amount;
+            this.event(`Deposited ${amount.toLocaleString()} ${DEPOSIT_NAMES[room]}`);
+        }
+        s.depositRoom = room;
+        s.depositCount = count;
+    }
+
+    /** Session points gained, ignoring spending and widget glitches. */
+    notePoints(room, value) {
+        const s = this.session;
+        const last = s.seen[room];
+        s.seen[room] = value;
+        if (!this.running || last === null || value <= last) return;
+        const step = value - last;
+        if (step > MAX_POINT_STEP) return;
+        s.gained[room] += step;
+        s.lastGainTick = this.tick;
+        const goal = this.goalFor(room);
+        if (last < goal && value >= goal) this.event(`${ROOM_NAMES[room]} goal reached`, COLOR.GOOD);
+    }
+
+    /** Per-hour rate of `amount` over `ticks`, or null while there's too little data. */
+    perHour(amount, ticks) {
+        if (ticks < RATE_MIN_TICKS) return null;
+        return amount * TICKS_PER_HOUR / ticks;
+    }
+
+    xpPerHour() {
+        return this.perHour(this.session.xpGained, this.session.runTicks);
+    }
+
+    /** Points per hour measured only over the time spent inside `room`. */
+    pointsPerHour(room) {
+        return this.perHour(this.session.gained[room], this.session.roomTicks[room]);
+    }
+
+    xpPerHourIn(room) {
+        return this.perHour(this.session.xpByRoom[room], this.session.roomTicks[room]);
+    }
+
+    /** Seconds until the room's goal at the current rate, or null when unknown. */
+    goalEtaSeconds(room) {
+        if (this.goalReached(room)) return 0;
+        const rate = this.pointsPerHour(room);
+        if (!rate || this.points[room] === null) return null;
+        return (this.goalFor(room) - this.points[room]) / rate * 3600;
+    }
+
+    ticksSinceProgress() {
+        const last = this.session.lastGainTick;
+        return last === null ? 0 : Math.max(0, this.tick - last);
+    }
+
+    event(text, color) {
+        this.log(text);
+        this.events.unshift({ tick: this.tick, text, color: color || COLOR.TEXT });
+        if (this.events.length > EVENT_LOG_SIZE) this.events.length = EVENT_LOG_SIZE;
+    }
+
+    // ---- HUD ----------------------------------------------------------------
+    /** The room the points/room sections describe: current, else target, else the chosen room. */
+    focusRoom() {
+        if (this.currentRoom !== null) return this.currentRoom;
+        if (this.targetRoom !== null) return this.targetRoom;
+        const mode = this.roomSetting.value;
+        return mode === AUTO_ROOM ? null : mode;
+    }
+
+    /**
+     * The HUD as rows shared by the overlay panel and the side panel:
+     * { title, color } | { left, right, color } | { bar, text, color }.
+     */
+    hudRows(detailed) {
+        const rows = [];
+        const s = this.session;
+        const room = this.focusRoom();
+        // The side panel builds on the login screen too; skip live game reads there.
+        const ready = titan.state.login.isWorldReady;
+        const title =(text, color) => rows.push({ title: text, color: color || COLOR.ACCENT });
+        const line = (left, right, color) => rows.push({ left, right: String(right), color: color || COLOR.TEXT });
+        const bar = (fraction, text, color) => rows.push({ bar: clamp(fraction, 0, 1), text, color });
+
+        // State
+        const runtime = formatTicks(s.runTicks);
+        if (this.running) line("Status", `Running  ${runtime}`, COLOR.GOOD);
+        else line("Status", s.runTicks > 0 ? `Stopped  ${runtime}` : "Stopped", COLOR.BAD);
+        const mode = this.roomSetting.value === AUTO_ROOM ? " (Auto)" : "";
+        line("Room", `${this.roomLabel()}${mode}`);
+        line("Doing", truncate(this.status, HUD_STATUS_CHARS), this.running ? COLOR.TEXT : COLOR.DIM);
+
+        // Magic XP
+        const skills = titan.state.skills;
+        const xpRate = this.xpPerHour();
+        if (detailed && ready) {
+            const level = skills.real(titan.Skill.MAGIC);
+            const xp = skills.experience(titan.Skill.MAGIC);
+            title("Magic", COLOR.XP);
+            const levels = s.levelStart !== null && level > s.levelStart ? `  (+${level - s.levelStart})` : "";
+            line("Level", `${level}${levels}`);
+            line("XP gained", `${formatShort(s.xpGained)}  (${xpRate === null ? "-" : formatShort(xpRate)}/h)`);
+            if (level < 99) {
+                const floor = xpForLevel(level);
+                const next = xpForLevel(level + 1);
+                const eta = xpRate ? `  ${formatDuration((next - xp) / xpRate * 3600)}` : "";
+                line(`To level ${level + 1}`, `${formatShort(Math.max(0, next - xp))}${eta}`);
+                bar((xp - floor) / Math.max(1, next - floor), null, COLOR.XP);
+            }
+        } else if (!detailed) {
+            line("Magic XP/h", xpRate === null ? "-" : formatShort(xpRate), COLOR.XP);
+        }
+
+        // Points for the focus room
+        if (room !== null) {
+            const rate = this.pointsPerHour(room);
+            const eta = this.goalEtaSeconds(room);
+            const etaText = eta === 0 ? "Done" : eta === null ? "-" : formatDuration(eta);
+            if (detailed) {
+                title(`${ROOM_NAMES[room]} points`);
+                line("Points", `${this.pointsLabel(room)} / ${this.goalFor(room).toLocaleString()}`,
+                    this.goalReached(room) ? COLOR.GOOD : COLOR.TEXT);
+                line("Session", `+${s.gained[room].toLocaleString()}  (${rate === null ? "-" : formatShort(rate)}/h)`);
+                const roomXp = this.xpPerHourIn(room);
+                line("Time in room", `${formatTicks(s.roomTicks[room])}  (${roomXp === null ? "-" : formatShort(roomXp)} xp/h)`);
+                line("Goal in", etaText, eta === 0 ? COLOR.GOOD : COLOR.TEXT);
+                bar(this.roomProgress(room), null, COLOR.ACCENT);
+            } else {
+                line(`${ROOM_NAMES[room]} pts/h`, rate === null ? "-" : formatShort(rate), COLOR.ACCENT);
+                line("Goal in", etaText);
+            }
+        }
+
+        if (detailed && ready && this.currentRoom !== null) {
+            this.roomDetailRows(this.currentRoom, title, line);
+        }
+
+        if (this.hudShowGoals.value) {
+            title("Goals");
+            ROOMS.forEach((r) => {
+                const done = this.goalReached(r);
+                const marker = r === this.currentRoom ? "> " : "";
+                line(`${marker}${ROOM_NAMES[r]}`, `${this.pointsLabel(r)} / ${this.goalFor(r).toLocaleString()}`,
+                    done ? COLOR.GOOD : r === this.currentRoom ? COLOR.ACCENT : COLOR.TEXT);
+            });
+            bar(this.totalProgress(), `${Math.floor(this.totalProgress() * 100)}% of all goals`, COLOR.GOOD);
+        }
+
+        if (this.running) {
+            const idle = this.ticksSinceProgress();
+            const color = idle < 100 ? COLOR.DIM : idle < 300 ? COLOR.WARN : COLOR.BAD;
+            line("Last progress", `${formatTicks(idle)} ago`, color);
+        }
+        return rows;
+    }
+
+    /** Room-specific state, so it's clear what the script is weighing up. */
+    roomDetailRows(room, title, line) {
+        const inv = titan.utils.inventory;
+        switch (room) {
+            case ROOM.TELEKINETIC: {
+                const t = this.tele;
+                title("Maze");
+                line("Next grab", t.dir ? capitalize(t.dir.name) : "-");
+                line("Grabs to finish", t.moves === null ? "-" : t.moves);
+                line("Mazes solved", this.session.mazes);
+                break;
+            }
+            case ROOM.ALCHEMIST: {
+                const a = this.alch;
+                const bestValue = a.best >= 0 ? a.costs[a.best] : -1;
+                title("Alchemy");
+                line("Best item", a.best >= 0 ? `${ALCH_ITEM_NAMES[a.best]} (${bestValue})` : "Reading prices");
+                const checked = new Set(a.observations.map((obs) => obs.pos)).size;
+                line("Best cupboard", a.bestCupboard ? "Known" : `Searching (${checked}/${a.order.length})`,
+                    a.bestCupboard ? COLOR.GOOD : COLOR.WARN);
+                line("Coins held", `${inv.count(ITEM.MTA_COINS).toLocaleString()} / ${this.alchDepositAt.value.toLocaleString()}`);
+                line("Coins deposited", this.session.deposited[ROOM.ALCHEMIST].toLocaleString());
+                break;
+            }
+            case ROOM.ENCHANTING: {
+                const e = this.ench;
+                title("Enchanting");
+                line("Bonus shape", e.bonus ? capitalize(e.bonus.key) : "Unknown", e.bonus ? COLOR.GOOD : COLOR.DIM);
+                const shapes = titan.queries.inventory().ids(...ENCHANTABLE).count();
+                line("Phase", `${capitalize(e.phase)}  (${shapes} to enchant)`);
+                line("Spell", e.spell ? e.spell.name : this.enchantLevel.value > 0 ? `Lvl-${this.enchantLevel.value} Enchant` : "-");
+                line("Orbs", `${inv.count(ITEM.ORB)} held, ${this.session.deposited[ROOM.ENCHANTING].toLocaleString()} deposited`);
+                break;
+            }
+            case ROOM.GRAVEYARD: {
+                const g = this.grave;
+                const skills = titan.state.skills;
+                const hp = skills.boosted(titan.Skill.HITPOINTS);
+                const maxHp = Math.max(1, skills.real(titan.Skill.HITPOINTS));
+                const low = hp * 100 < this.graveEatPercent.value * maxHp;
+                title("Graveyard");
+                line("Hitpoints", `${hp} / ${maxHp}`, low ? COLOR.BAD : COLOR.TEXT);
+                line("Spell", g.peaches ? "Bones to Peaches" : "Bones to Bananas");
+                line("Bones", `${g.bones} held (${g.fruitValue}/${g.target} fruit)`);
+                line("Fruit", `${this.fruitCount()} held, ${this.session.deposited[ROOM.GRAVEYARD].toLocaleString()} deposited`);
+                line("Food eaten", this.session.eaten);
+                break;
+            }
+        }
+
+        const rune = ROOM_RUNES[room];
+        const runes = inv.count(rune.id);
+        line(`${rune.name} runes`, runes > 0 ? runes.toLocaleString() : "none in inventory",
+            runes > 0 && runes < 100 ? COLOR.WARN : runes > 0 ? COLOR.TEXT : COLOR.DIM);
+        line("Casts", this.session.casts.toLocaleString());
+    }
+
+    renderHud(panel) {
+        if (!this.showHud.value) return;
+        const detailed = this.hudDetail.value === 1;
+        panel.title(`${this.name}  v${this.version}`, COLOR.ACCENT);
+        const error = this.latestUnseenReport();
+        if (error) panel.line(REPORT_KINDS[error.kind].label, "see MTA side panel", COLOR.BAD, COLOR.BAD);
+        this.hudRows(detailed).forEach((row) => {
+            if (row.title !== undefined) panel.title(row.title, row.color);
+            else if (row.bar !== undefined) panel.progressBar(Math.round(row.bar * 1000), 0, 1000, row.color, COLOR.BAR_BG);
+            else panel.line(row.left, row.right, COLOR.DIM, row.color);
+        });
+
+        const count = this.hudEventLines.value | 0;
+        if (count > 0 && this.events.length > 0) {
+            panel.title("Recent", COLOR.DIM);
+            this.events.slice(0, count).forEach((ev) => {
+                panel.line(truncate(ev.text, HUD_STATUS_CHARS), this.ageLabel(ev.tick), ev.color, COLOR.DIM);
+            });
+        }
+    }
+
+    buildSidePanel(panel) {
+        panel.separatorText(this.name)
+            .button(this.running ? "Stop" : "Start", 1)
+            .spacing();
+        this.buildErrorCard(panel);
+
+        panel.beginTabBar("mta_tabs");
+
+        panel.beginTabItem("Overview");
+        this.hudRows(true).forEach((row) => {
+            if (row.title !== undefined) panel.separatorText(row.title);
+            else if (row.bar !== undefined) panel.progress(row.bar, row.text || `${Math.floor(row.bar * 100)}%`);
+            else panel.label(row.left, row.right);
+        });
+        panel.endTabItem();
+
+        panel.beginTabItem("Rooms");
+        this.buildRoomsTable(panel);
+        panel.endTabItem();
+
+        // Only exists once something has gone wrong.
+        if (this.reports.length > 0) {
+            panel.beginTabItem(`Errors (${this.reports.length})`);
+            this.buildErrorsTab(panel);
+            panel.endTabItem();
+        }
+
+        panel.endTabBar();
+
+        panel.spacing()
+            .button("Reset session stats", 3)
+            .sameLine()
+            .button("Forget tracked points", 2);
+    }
+
+    buildRoomsTable(panel) {
+        const s = this.session;
+        panel.beginTable("mta_rooms", 6);
+        ["Room", "Points", "Session", "Pts/h", "Time", "Goal in"].forEach((label) => panel.tableSetupColumn(label));
+        panel.tableHeadersRow();
+        ROOMS.forEach((room) => {
+            const rate = this.pointsPerHour(room);
+            const eta = this.goalEtaSeconds(room);
+            const cells = [
+                ROOM_NAMES[room],
+                `${this.pointsLabel(room)} / ${this.goalFor(room).toLocaleString()}`,
+                `+${s.gained[room].toLocaleString()}`,
+                rate === null ? "-" : formatShort(rate),
+                formatTicks(s.roomTicks[room]),
+                eta === 0 ? "Done" : eta === null ? "-" : formatDuration(eta),
+            ];
+            panel.tableNextRow();
+            cells.forEach((cell) => {
+                panel.tableNextColumn();
+                panel.text(cell);
+            });
+        });
+        panel.endTable();
+
+        const total = s.gained.reduce((sum, v) => sum + v, 0);
+        const allRate = this.perHour(total, s.runTicks);
+        panel.spacing();
+        this.valueTable(panel, "mta_room_totals", [
+            ["Points this session", total.toLocaleString()],
+            ["Points/h (all, incl. travel)", allRate === null ? "-" : formatShort(allRate)],
+            ["Time in lobby / walking", formatTicks(s.travelTicks)],
+            ["Mazes solved", String(s.mazes)],
+            ["Coins deposited", s.deposited[ROOM.ALCHEMIST].toLocaleString()],
+            ["Orbs deposited", s.deposited[ROOM.ENCHANTING].toLocaleString()],
+            ["Fruit deposited", s.deposited[ROOM.GRAVEYARD].toLocaleString()],
+        ]);
+    }
+
+    /**
+     * Label/value rows with every value in a fixed-width column on the right
+     * edge. panel.label() puts the value at a fixed offset, which long labels
+     * run into.
+     */
+    valueTable(panel, id, rows) {
+        panel.beginTable(id, 2);
+        panel.tableSetupColumn("Stat", IMGUI_COLUMN.WIDTH_STRETCH, 0);
+        panel.tableSetupColumn("Value", IMGUI_COLUMN.WIDTH_FIXED, VALUE_COLUMN_WIDTH);
+        rows.forEach(([label, value]) => {
+            panel.tableNextRow();
+            panel.tableNextColumn();
+            panel.text(label);
+            panel.tableNextColumn();
+            panel.text(value);
+        });
+        panel.endTable();
+    }
+
+    ageLabel(tick) {
+        const ticks = Math.max(0, this.tick - tick);
+        const seconds = ticks * 0.6;
+        if (seconds < 60) return `${Math.floor(seconds)}s`;
+        if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+        return `${Math.floor(seconds / 3600)}h`;
+    }
+
+    // ---- Error log ----------------------------------------------------------
+    // Nothing here is shown while things work. Every game action goes into a
+    // short breadcrumb trail; when something goes wrong a report captures
+    // what happened, why, how to fix it, the state, and that trail. Reports
+    // appear in the side panel and are written in full to the client log.
+
+    /** Record a game action for error context. Returns `ok` so calls can be wrapped inline. */
+    action(text, ok) {
+        const success = !!ok;
+        this.crumb(text, success ? "action" : "fail");
+        if (success) {
+            this.failStreak = { text: "", count: 0 };
+            return ok;
+        }
+        if (this.failStreak.text === text) this.failStreak.count++;
+        else this.failStreak = { text, count: 1 };
+        if (this.failStreak.count === FAIL_STREAK_LIMIT) {
+            this.report("failing", `"${text}" keeps failing`,
+                `The client rejected this action ${FAIL_STREAK_LIMIT} times in a row. The target may be `
+                + "out of reach, gone, or covered by an open interface.",
+                "Close any open interface and check the path is clear. If it keeps happening, the "
+                + "object id or option name is probably wrong for this room.");
+        }
+        return ok;
+    }
+
+    /** kind: "action" | "fail" | "info". Consecutive repeats collapse into one entry with a count. */
+    crumb(text, kind) {
+        const last = this.crumbs[this.crumbs.length - 1];
+        if (last && last.text === text && last.kind === kind) {
+            last.count++;
+            last.tick = this.tick;
+            return;
+        }
+        this.crumbs.push({ tick: this.tick, text, kind, count: 1 });
+        if (this.crumbs.length > CRUMB_LIMIT) this.crumbs.shift();
+    }
+
+    /**
+     * Add an error report. A repeat of the newest report bumps its count
+     * (and shows it again if it was dismissed) instead of adding a new one.
+     */
+    report(kind, title, why, fix, details) {
+        const latest = this.reports[0];
+        if (latest && latest.kind === kind && latest.title === title && latest.why === why) {
+            latest.count++;
+            latest.tick = this.tick;
+            latest.time = clockTime();
+            latest.crumbs = this.crumbs.map((c) => ({ ...c }));
+            latest.state = this.snapshot();
+            this.dismissedReport = Math.min(this.dismissedReport, latest.id - 1);
+            this.log(`${REPORT_KINDS[kind].label} repeated (x${latest.count}): ${title}`);
+            return;
+        }
+
+        const report = {
+            id: ++this.reportSeq,
+            kind,
+            title,
+            why: why || "",
+            fix: fix || "",
+            details: details || [],
+            tick: this.tick,
+            time: clockTime(),
+            count: 1,
+            room: this.roomLabel(),
+            status: this.status,
+            crumbs: this.crumbs.map((c) => ({ ...c })),
+            state: this.snapshot(),
+        };
+        this.reports.unshift(report);
+        if (this.reports.length > REPORT_LIMIT) this.reports.length = REPORT_LIMIT;
+        this.writeReportToLog(report);
+    }
+
+    /** `context` names what was running when it isn't the tick loop (e.g. "drawing the HUD"). */
+    reportException(error, context) {
+        const message = error && error.message ? error.message : String(error);
+        const stack = error && error.stack ? String(error.stack) : "";
+        const frames = stack.split("\n").map((l) => l.trim()).filter((l) => l.startsWith("at "))
+            .map((l) => this.describeFrame(l));
+        // Point at the plugin's own code rather than the host API it called into.
+        const own = frames.find((f) => f.own) || frames[0];
+        const where = own ? own.text : "an unknown function";
+        const during = context || `"${this.status}" (${this.roomName(this.currentRoom)})`;
+        const retry = context ? "" : " The script skips a few ticks and retries; 10 in a row stops it.";
+        this.log(`error: ${message}\n${stack}`);
+        this.report("error", `Script error: ${truncate(message, 60)}`,
+            `${error && error.name ? error.name : "Error"} in ${where} while ${during}.${retry}`,
+            "This is a bug in the script. Press 'Write to client log' and send the report in.",
+            frames.slice(0, 6).map((f) => f.text));
+    }
+
+    /** "at Foo.tickEnchanting (path/profMTA.js:1376:27)" -> "tickEnchanting() line 1376". */
+    describeFrame(frame) {
+        const body = frame.slice(3);
+        const name = (body.split(" (")[0] || "").split(".").pop();
+        const line = body.match(/:(\d+)(?::\d+)?\)?$/);
+        const own = typeof MageTrainingArenaPlugin.prototype[name] === "function";
+        return { own, text: `${name || "?"}()${line ? ` line ${line[1]}` : ""}` };
+    }
+
+    /** Run a per-frame draw callback; a throw is reported once instead of every frame. */
+    guardRender(what, fn) {
+        try {
+            fn();
+        } catch (error) {
+            const key = `${what}:${error && error.message}`;
+            if (this.renderErrors.has(key)) return;
+            this.renderErrors.add(key);
+            this.reportException(error, `drawing the ${what}`);
+        }
+    }
+
+    /** Report once per stall when neither points nor Magic XP have gone up for a while. */
+    checkStuck() {
+        const idle = this.ticksSinceProgress();
+        if (idle < this.stuckMinutes.value * 100) {
+            this.stuckReported = false;
+            return;
+        }
+        if (this.stuckReported) return;
+        this.stuckReported = true;
+        const room = this.currentRoom === null ? "Any room's" : `${ROOM_NAMES[this.currentRoom]}`;
+        this.report("stuck", `No progress for ${formatTicks(idle)}`,
+            `${room} points and Magic XP haven't gone up for ${formatTicks(idle)}. `
+            + `The script is currently "${this.status}".`,
+            this.stuckHint());
+    }
+
+    stuckHint() {
+        const status = this.status.toLowerCase();
+        if (status.includes("coords") || status.includes("not in view") || status.includes("looking for")) {
+            return "It can't find its target in the loaded scene. Stand closer, or fill in the matching "
+                + "COORDS entry at the top of profMTA.js so it can walk there.";
+        }
+        if (this.currentRoom === null) {
+            return "It hasn't managed to enter a room. Start from the MTA lobby near the four portals.";
+        }
+        const repeats = this.crumbs.length > 0 ? this.crumbs[this.crumbs.length - 1].count : 0;
+        if (repeats >= 3) {
+            return "The same action has been repeated with no result (see the last actions). The click "
+                + "probably isn't landing: check the option name, and that no interface is open.";
+        }
+        return "Check the last actions below to see what it has been trying.";
+    }
+
+    /** State worth knowing when reading a report. Never throws (it runs on the error path). */
+    snapshot() {
+        const safe = (fn) => {
+            try {
+                return String(fn());
+            } catch (error) {
+                return "?";
+            }
+        };
+        const room = this.currentRoom;
+        return [
+            ["Version", this.version],
+            ["Mode", this.roomLabelForMode()],
+            ["Room", this.roomLabel()],
+            ["Doing", this.status],
+            ["Waiting on", safe(() => this.pending
+                ? `${this.pending.key} (${formatTicks(this.tick - this.pending.tick)})` : "nothing")],
+            ["Run time", formatTicks(this.session.runTicks)],
+            ["Logged in", safe(() => (titan.state.login.isWorldReady ? "yes" : "no"))],
+            ["Free slots", safe(() => titan.utils.inventory.emptySlots)],
+            ["Hitpoints", safe(() => `${titan.state.skills.boosted(titan.Skill.HITPOINTS)}/`
+                + `${titan.state.skills.real(titan.Skill.HITPOINTS)}`)],
+            ["Magic level", safe(() => titan.state.skills.boosted(titan.Skill.MAGIC))],
+            ["Room points", room === null ? "-" : `${this.pointsLabel(room)} / ${this.goalFor(room).toLocaleString()}`],
+            ["Runes", room === null ? "-" : safe(() => `${titan.utils.inventory.count(ROOM_RUNES[room].id)} `
+                + `${ROOM_RUNES[room].name.toLowerCase()}`)],
+        ];
+    }
+
+    /** "-12.6s" relative to the report, so the trail reads as a timeline. */
+    crumbOffset(report, crumb) {
+        const seconds = (report.tick - crumb.tick) * 0.6;
+        return seconds <= 0 ? "now" : `-${seconds.toFixed(1)}s`;
+    }
+
+    crumbText(crumb) {
+        const repeat = crumb.count > 1 ? ` x${crumb.count}` : "";
+        const failed = crumb.kind === "fail" ? " [FAILED]" : "";
+        return `${crumb.text}${repeat}${failed}`;
+    }
+
+    writeReportToLog(report) {
+        const kind = REPORT_KINDS[report.kind];
+        const lines = [
+            `===== ${kind.label} #${report.id} at ${report.time}${report.count > 1 ? ` (x${report.count})` : ""} =====`,
+            `What: ${report.title}`,
+            `Why:  ${report.why}`,
+        ];
+        if (report.fix) lines.push(`Fix:  ${report.fix}`);
+        report.details.forEach((detail) => lines.push(`  ${detail}`));
+        lines.push(`State: ${report.state.map(([k, v]) => `${k}=${v}`).join("; ")}`);
+        lines.push(`Last ${report.crumbs.length} actions (oldest first):`);
+        report.crumbs.forEach((crumb) => lines.push(`  ${this.crumbOffset(report, crumb).padStart(7)}  ${this.crumbText(crumb)}`));
+        lines.forEach((line) => this.log(line));
+    }
+
+    latestUnseenReport() {
+        const latest = this.reports[0];
+        return latest && latest.id > this.dismissedReport ? latest : null;
+    }
+
+    /** One report's body. `suffix` keeps collapsible labels unique when a report is drawn twice. */
+    buildReportBody(panel, report, suffix) {
+        const kind = REPORT_KINDS[report.kind];
+        const repeat = report.count > 1 ? `  (x${report.count})` : "";
+        panel.status(`${kind.label}${repeat}`, kind.tone)
+            .wrapped(report.title)
+            .label("When", `${report.time}  (${this.ageLabel(report.tick)} ago)`)
+            .label("Room", report.room)
+            .label("Doing", report.status)
+            .separatorText("Why")
+            .wrapped(report.why);
+        if (report.fix) panel.separatorText("Fix").wrapped(report.fix);
+
+        panel.beginCollapsible(`Last ${report.crumbs.length} actions${suffix}`, true);
+        if (report.crumbs.length === 0) panel.disabled("No actions yet");
+        report.crumbs.forEach((crumb) => {
+            const color = crumb.kind === "fail" ? COLOR.BAD : crumb.kind === "info" ? COLOR.DIM : COLOR.TEXT;
+            panel.colored(`${this.crumbOffset(report, crumb).padStart(7)}  ${this.crumbText(crumb)}`, color);
+        });
+        panel.endCollapsible();
+
+        if (report.details.length > 0) {
+            panel.beginCollapsible(`Stack${suffix}`, false);
+            report.details.forEach((detail) => panel.disabled(detail));
+            panel.endCollapsible();
+        }
+
+        panel.beginCollapsible(`State at the time${suffix}`, false);
+        report.state.forEach(([label, value]) => panel.label(label, value));
+        panel.endCollapsible();
+    }
+
+    buildErrorCard(panel) {
+        const report = this.latestUnseenReport();
+        if (!report) return;
+        panel.beginCard("mta_error_card");
+        this.buildReportBody(panel, report, "");
+        panel.spacing()
+            .button("Dismiss", 4)
+            .sameLine()
+            .button("Write to client log", 5);
+        panel.endCard();
+        panel.spacing();
+    }
+
+    buildErrorsTab(panel) {
+        this.reports.forEach((report) => {
+            const kind = REPORT_KINDS[report.kind];
+            panel.beginCollapsible(`#${report.id}  ${report.time}  ${kind.label}: ${truncate(report.title, 40)}`, false);
+            this.buildReportBody(panel, report, ` #${report.id}`);
+            panel.smallButton(`Write #${report.id} to client log`, 100 + report.id);
+            panel.endCollapsible();
+        });
+        panel.spacing().button("Clear error log", 6);
+    }
+
+    onPanelAction(actionId) {
+        if (actionId === 1) this.toggleAutomation();
+        else if (actionId === 2) this.resetTrackedPoints();
+        else if (actionId === 3) this.resetSession();
+        else if (actionId === 4 && this.reports[0]) this.dismissedReport = this.reports[0].id;
+        else if (actionId === 5 && this.reports[0]) this.writeReportToLog(this.reports[0]);
+        else if (actionId === 6) {
+            this.reports = [];
+            this.dismissedReport = this.reportSeq;
+        } else if (actionId > 100) {
+            const report = this.reports.find((r) => r.id === actionId - 100);
+            if (report) this.writeReportToLog(report);
+        }
+    }
+
+    roomLabelForMode() {
+        const mode = this.roomSetting.value;
+        return mode === AUTO_ROOM ? "Auto" : ROOM_NAMES[mode];
+    }
+
     // ---- Overlay ------------------------------------------------------------
     renderScene() {
         if (!this.running || this.currentRoom === null) return;
         const overlay = titan.overlay;
 
+        const labels = this.sceneLabels.value;
+
         if (this.currentRoom === ROOM.TELEKINETIC && this.tele.maze) {
-            const { maze, standTile } = this.tele;
-            if (standTile) overlay.tileQuad(standTile.x, standTile.y, standTile.plane, 0x5500FF88, 0xFF00FF88);
-            if (maze.finish) overlay.tileQuad(maze.finish.x, maze.finish.y, maze.plane, 0x55FFD700, 0xFFFFD700);
-        } else if (this.currentRoom === ROOM.ALCHEMIST && this.alch.bestCupboard) {
-            const cupboard = this.alch.cupboards.get(this.alch.bestCupboard);
+            const { maze, standTile, dir, moves, guardianTile } = this.tele;
+            if (standTile) {
+                overlay.tileQuad(standTile.x, standTile.y, standTile.plane, 0x5500FF88, 0xFF00FF88);
+                if (labels && dir) this.tileLabel(standTile.x, standTile.y, standTile.plane, `Grab ${dir.name}`, COLOR.GOOD);
+            }
+            if (maze.finish) {
+                overlay.tileQuad(maze.finish.x, maze.finish.y, maze.plane, 0x55FFD700, 0xFFFFD700);
+                if (labels) this.tileLabel(maze.finish.x, maze.finish.y, maze.plane, "Finish", COLOR.WARN);
+            }
+            if (labels && guardianTile && moves !== null) {
+                this.tileLabel(guardianTile.x, guardianTile.y, guardianTile.plane, `${moves} to go`, COLOR.TEXT);
+            }
+        } else if (this.currentRoom === ROOM.ALCHEMIST) {
+            const a = this.alch;
+            const cupboard = a.bestCupboard ? a.cupboards.get(a.bestCupboard) : null;
             if (cupboard) overlay.tileObjectHull(cupboard, 0xFF00FF88, 0x3300FF88);
+            if (labels) this.labelCupboards();
         } else if (this.currentRoom === ROOM.ENCHANTING && this.ench.pile && this.ench.pile.exists) {
-            overlay.tileObjectHull(this.ench.pile, 0xFF9B7BFF, 0x339B7BFF);
+            const pile = this.ench.pile;
+            overlay.tileObjectHull(pile, COLOR.ACCENT, 0x339B7BFF);
+            if (labels) {
+                const shape = this.pileShape(pile);
+                const bonus = this.ench.bonus && shape === this.ench.bonus.key;
+                this.tileLabel(pile.tileX, pile.tileY, pile.plane,
+                    `${capitalize(shape || "shapes")}${bonus ? " (bonus)" : ""}`, bonus ? COLOR.GOOD : COLOR.TEXT);
+            }
         }
+    }
+
+    /** What each cupboard holds: seen (white), inferred (grey), or the target (green). */
+    labelCupboards() {
+        const a = this.alch;
+        a.order.forEach((key, pos) => {
+            const obj = a.cupboards.get(key);
+            if (!obj) return;
+            const seen = a.observations.find((obs) => obs.pos === pos);
+            const item = seen ? seen.item : this.predictCupboard(pos, a.dir);
+            if (item === null) {
+                this.tileLabel(obj.tileX, obj.tileY, obj.plane, "?", COLOR.DIM);
+                return;
+            }
+            const name = item === EMPTY_CUPBOARD ? "Empty" : ALCH_ITEM_NAMES[item];
+            const color = key === a.bestCupboard ? COLOR.GOOD : seen ? COLOR.TEXT : COLOR.DIM;
+            this.tileLabel(obj.tileX, obj.tileY, obj.plane, name, color);
+        });
+    }
+
+    /** Text roughly centred over a scene tile. */
+    tileLabel(x, y, plane, text, color) {
+        const point = titan.overlay.tileToScreen(x, y, plane);
+        if (!point) return;
+        titan.overlay.screenText(Math.round(point.x - text.length * 3), Math.round(point.y - 6), text, color);
     }
 
     // ---- Misc ---------------------------------------------------------------
@@ -1507,21 +2472,16 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         return this.points[room] === null ? "?" : this.points[room].toLocaleString();
     }
 
-    formatDuration(seconds) {
-        const total = Math.floor(seconds);
-        const hours = Math.floor(total / 3600);
-        const minutes = Math.floor((total % 3600) / 60);
-        return `${hours}h ${minutes}m`;
-    }
-
     log(message) {
         titan.log(`[Prof] MTA ${message}`);
     }
 
-    warnOnce(key, message) {
+    /** Report a problem once per run (warnings reset on Start). */
+    warnOnce(key, message, why, fix) {
         if (this.warned.has(key)) return;
         this.warned.add(key);
-        this.log(message);
+        this.event(message, COLOR.WARN);
+        this.report("warning", message, why || message, fix || "");
     }
 }
 

@@ -4,15 +4,28 @@ A TitanClient JavaScript plugin (QuickJS runtime) that runs Mage Training Arena
 rooms for pizazz points. The goal is every reward: 2,825 Telekinetic,
 3,275 Alchemist, 29,000 Enchanting and 2,825 Graveyard points.
 
-## Install
+## Run / test
+
+```powershell
+.\gradlew.bat runViaTitan
+```
+
+This opens a dedicated **prof-mta** DEV tab with the plugin loaded from
+`build/.titan/dev/prof-mta/load/gen-N/`. After editing `js/profMTA.js`, run
+`.\gradlew.bat build` to stage the change, then click the refresh button in
+the prof-mta tab to load it. Running `runViaTitan` again recycles only the
+prof-mta tab.
+`runViaTitanDebug` works too, although it only attaches a Java debugger.
+
+Enable **[Prof] Mage Training Arena** in the tab, choose a room in the
+settings, then press **Start** in the MTA side panel.
+
+Other scripts:
 
 ```powershell
 .\js\fetch-types.ps1   # optional: SDK typings for IntelliSense (js/types/, gitignored)
-.\js\deploy.ps1        # copies profMTA.js to %USERPROFILE%\.titanclient\plugins
+.\js\deploy.ps1        # permanent install to %USERPROFILE%\.titanclient\plugins (no hot reload)
 ```
-
-Enable **[Prof] Mage Training Arena** in the controller, choose a room in the
-settings, then press **Start** in the MTA side panel.
 
 ## Rooms
 
@@ -31,6 +44,51 @@ furthest from its goal. The inventory must hold the supplies for every room.
 Points are read from the room HUD and the lobby overview and persisted between
 sessions. Lower the per-room goals under *Point goals* if you've already bought
 some rewards.
+
+## HUD
+
+The in-game overlay panel (Alt-drag to move) shows:
+
+- **State:** running/stopped with run time, current room and mode, and what the
+  script is doing right now.
+- **Magic:** level (+levels gained), XP gained and XP/h, XP to next level with
+  ETA, and a progress bar.
+- **Room points:** points / goal, session gain and points/h, time in the room
+  (with that room's XP/h), and time to goal. Points/h only counts time spent
+  inside that room, so walking and Auto-mode room swaps don't skew it.
+- **Room details:** maze next grab and grabs to finish; alchemy best item,
+  cupboard search progress and coins; enchanting bonus shape, phase, spell and
+  orbs; graveyard HP, spell, bones/fruit and food eaten. Also the room's rune
+  count and cast count.
+- **Goals:** all four rooms against their goals, and **Last progress**, which
+  turns yellow or red if points and XP stop going up.
+- **Recent:** the last few notable events (0 hides them).
+
+*Settings → HUD* switches between Compact and Detailed and toggles the
+sections and scene labels. The side panel shows the same data in an
+*Overview* tab plus a *Rooms* table (points/h, time and ETA for every room).
+
+## Error log
+
+While everything works, the error log shows nothing. The script keeps a
+breadcrumb trail of its last 15 game actions (clicks, casts, walks, eats and
+drops, with repeats collapsed to `x3` and failures flagged). A report is
+created when:
+
+| Report | Trigger |
+| --- | --- |
+| Script error | An exception in the tick loop or a draw callback. Shows the plugin function and line. |
+| Stopped | The script stopped itself for a reason other than reaching the goal (out of runes, level too low, full inventory, 10 errors in a row). |
+| Action failing | The same action was rejected 3 times in a row. |
+| No progress | No points or Magic XP for *HUD → Report no progress after* minutes (default 3). |
+| Warning | A menu option isn't on the object, or HP is low with no food. |
+
+Each report states what happened, why, and how to fix it. It also records a
+state snapshot and the last 15 actions as a timeline. The newest unread report
+appears as a card at the top of the MTA side panel, and an *Errors* tab
+(present only once something has failed) keeps the last 10. The HUD shows a
+single "see MTA side panel" line until the report is dismissed. *Write to
+client log* prints the full report to the client log for sharing.
 
 ## Coordinates template
 
