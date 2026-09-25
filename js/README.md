@@ -34,7 +34,7 @@ Set up the inventory and equipment for the room before starting.
 | Room | Needs | Loop |
 | --- | --- | --- |
 | Telekinetic | Law runes, air (or air staff) | Solves the maze by breadth-first search over statue slides, stands on the matching side, casts Telekinetic Grab, and starts a new maze when it's solved. |
-| Alchemist | Nature runes, fire (or fire staff) | Reads the price table, finds the 30-coin item's cupboard (infers the clockwise layout from searches), alchs it, drops items below the minimum value, and deposits coins. |
+| Alchemist | Nature runes, fire (or fire staff) | Reads the price table, searches one cupboard to learn the layout (the 6 cupboards cycle through the items by object id, as in RuneLite's MTA plugin), takes the 30-coin item, alchs it, drops items below the minimum value, and deposits coins. |
 | Enchanting | Cosmic runes plus the staff/runes for the spell | Fills the inventory from the bonus-shape pile, picks up dragonstones, enchants everything, and deposits orbs. |
 | Graveyard | Nature runes, earth/water (or mud staff), food | Grabs bones up to a full deposit's worth of fruit, casts Bones to Peaches/Bananas, deposits, and eats below the HP threshold. |
 
@@ -107,10 +107,11 @@ live client:
   action is missing, the log lists the actions the object actually has.
 - **Maze walls:** the solver assumes the maze walls (object 10755) set collision
   flags, as RuneLite's MTA plugin does.
-- **Stand distance:** the side row is 1 tile beyond the outermost wall. This is
-  adjustable in settings.
+- **Stand distance:** the plugin stands on the outer wall line, where RuneLite
+  marks the cast tiles, never on a corner. This is adjustable in settings.
 - **Enchanting bonus:** the bonus shape is read as the only visible HUD shape
   icon.
-- **Cupboard order:** the Alchemist layout is inferred from cupboard angles
-  around the room centre. Contradictions flip the direction or reset knowledge.
+- **Cupboard order:** follows RuneLite. Slot n (from the object id) holds the
+  item after slot n-1's, and one slot is empty. One search (or the "You found:"
+  chat line) reveals every cupboard until the next price rotation.
 - **Graveyard deposit cap:** assumes 3 points per deposit (24 peaches).

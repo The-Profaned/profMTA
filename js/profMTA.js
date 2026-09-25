@@ -91,6 +91,7 @@ const ITEM = Object.freeze({
 const BONE_FRUIT = { 6904: 1, 6905: 2, 6906: 3, 6907: 4 };
 const ALCH_ITEM_KEYWORDS = ["boots", "kiteshield", "helm", "emerald", "longsword"];
 const EMPTY_CUPBOARD = 5;
+const NUM_CUPBOARDS = 6;
 
 const VARBIT_PEACHES_UNLOCKED = 1505; // MAGICTRAINING_BONESPEACHES
 
@@ -275,7 +276,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     name = "[Prof] Mage Training Arena";
     description = "Runs the selected Mage Training Arena room for pizazz points.";
     author = "Prof";
-    version = "0.2.0";
+    version = "0.2.1";
 
     enabled = false;
 
@@ -357,10 +358,11 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         name: "Stand distance outside maze",
         section: this.teleSection,
         position: 0,
-        default: 1,
-        min: 1,
+        default: 0,
+        min: 0,
         max: 4,
-        tooltip: "Tiles beyond the outermost maze wall to stand on when casting.",
+        tooltip: "Tiles beyond the outer maze wall line to stand on when casting. 0 stands on the "
+            + "wall line itself, which is where RuneLite's MTA plugin marks the cast tiles.",
     });
 
     teleScanRadius = this.createSetting("intSetting", {
@@ -645,9 +647,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             costs: [-1, -1, -1, -1, -1],
             best: -1,
             cupboards: new Map(),   // world key -> live TileObject
-            order: [],              // world keys, clockwise
-            dir: 1,
-            observations: [],       // { pos, item } with item 0..4 or EMPTY_CUPBOARD
+            anchor: null,           // { idx, item }: one searched cupboard's contents
             pendingSearch: null,
             emptyTick: -1,
             lastAlchTick: -100,
@@ -693,6 +693,12 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         const message = stripTags(event.message).toLowerCase();
         if (message.includes("cupboard is empty")) {
             this.alch.emptyTick = this.tick;
+        } else if (message.includes("you found:") && this.alch.pendingSearch) {
+            const item = ALCH_ITEM_KEYWORDS.findIndex((keyword) => message.includes(keyword));
+            if (item >= 0) {
+                this.recordCupboard(this.alch.pendingSearch.key, item);
+                this.alch.pendingSearch = null;
+            }
         } else if ((message.includes("do not have enough") || message.includes("don't have enough"))
             && message.includes("to cast")) {
             this.stop("Out of supplies", {
@@ -897,7 +903,8 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         const player = this.local();
         if (!player) return;
         const p = player.tile;
-        t.standTile = this.mazeStandTile(t.maze, dir, g);
+        // Out of spell range: pick the side tile nearest the guardian instead.
+        t.standTile = this.mazeStandTile(t.maze, dir, chebyshev(p, g) > 10 ? g : p);
 
         const onSide = this.onMazeSide(t.maze, dir, p);
         const tooFar = t.standTile && chebyshev(p, g) > 10 && tileKey(p) !== tileKey(t.standTile);
@@ -1011,27 +1018,35 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         return null;
     }
 
-    /** True when `tile` is on the side of the maze that pulls the guardian toward `dir`. */
+    /**
+     * True when `tile` is on the side of the maze that pulls the guardian
+     * toward `dir`: on or beyond that side's wall line, never a corner (a
+     * corner cast wastes the rune). Same test as RuneLite's getPosition().
+     */
     onMazeSide(maze, dir, tile) {
         if (tile.plane !== maze.plane) return false;
-        const inColumn = tile.x >= maze.minX && tile.x <= maze.maxX;
-        const inRow = tile.y >= maze.minY && tile.y <= maze.maxY;
+        const inColumn = tile.x > maze.minX && tile.x < maze.maxX;
+        const inRow = tile.y > maze.minY && tile.y < maze.maxY;
         switch (dir.name) {
-            case "north": return inColumn && tile.y > maze.maxY;
-            case "south": return inColumn && tile.y < maze.minY;
-            case "east": return inRow && tile.x > maze.maxX;
-            case "west": return inRow && tile.x < maze.minX;
+            case "north": return inColumn && tile.y >= maze.maxY;
+            case "south": return inColumn && tile.y <= maze.minY;
+            case "east": return inRow && tile.x >= maze.maxX;
+            case "west": return inRow && tile.x <= maze.minX;
         }
         return false;
     }
 
-    /** Closest walkable tile to the guardian on the side for `dir` (never a corner). */
-    mazeStandTile(maze, dir, guardianTile) {
+    /**
+     * Walkable tile on the side for `dir` closest to `origin` (the player, like
+     * RuneLite's hint arrow, so it walks as little as possible). Corners are
+     * excluded.
+     */
+    mazeStandTile(maze, dir, origin) {
         const base = this.teleSideOffset.value;
         const vertical = dir.dy !== 0;
         const along = vertical
-            ? { min: maze.minX, max: maze.maxX, origin: guardianTile.x }
-            : { min: maze.minY, max: maze.maxY, origin: guardianTile.y };
+            ? { min: maze.minX + 1, max: maze.maxX - 1, origin: origin.x }
+            : { min: maze.minY + 1, max: maze.maxY - 1, origin: origin.y };
         const edge = dir.name === "north" ? maze.maxY
             : dir.name === "south" ? maze.minY
                 : dir.name === "east" ? maze.maxX : maze.minX;
@@ -1159,7 +1174,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
                 this.event(`Prices rotated - best: ${ALCH_ITEM_NAMES[best]}`);
             }
             a.signature = signature;
-            a.observations = [];
+            a.anchor = null;
             a.bestCupboard = null;
         }
         a.costs = costs;
@@ -1191,31 +1206,23 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         return ITEM.ALCH_ITEMS.map((id) => titan.queries.inventory().id(id).count());
     }
 
-    /** Track the cupboards and their clockwise order around the room centre. */
+    /**
+     * Cupboard slot 0..5 from its object id (MAGICTRAINING_ALCHEM_CUPBOARDn and
+     * its _OPEN twin). As in RuneLite's MTA plugin, contents follow the slot
+     * order: slot n+1 holds the item after slot n's, with one empty slot.
+     */
+    cupboardIndex(obj) {
+        const idx = OBJ.CUPBOARDS.indexOf(obj.id);
+        return idx >= 0 ? idx >> 1 : -1;
+    }
+
     refreshCupboards() {
-        const a = this.alch;
         const found = new Map();
         titan.queries.objects(SCAN_RADIUS).ids(...OBJ.CUPBOARDS).forEach((obj) => {
             const wp = obj.worldPoint;
             found.set(`${wp.x},${wp.y},${wp.z}`, obj);
         });
-        a.cupboards = found;
-
-        const keys = Array.from(found.keys());
-        const sameSet = keys.length === a.order.length && keys.every((key) => a.order.includes(key));
-        if (sameSet) return;
-
-        const points = keys.map((key) => {
-            const [x, y] = key.split(",").map(Number);
-            return { key, x, y };
-        });
-        const cx = points.reduce((sum, p) => sum + p.x, 0) / Math.max(1, points.length);
-        const cy = points.reduce((sum, p) => sum + p.y, 0) / Math.max(1, points.length);
-        // Clockwise when viewed from above (north = +y): decreasing angle.
-        points.sort((l, r) => Math.atan2(r.y - cy, r.x - cx) - Math.atan2(l.y - cy, l.x - cx));
-        a.order = points.map((p) => p.key);
-        a.observations = [];
-        a.bestCupboard = null;
+        this.alch.cupboards = found;
     }
 
     resolveCupboardSearch() {
@@ -1237,67 +1244,46 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         this.recordCupboard(search.key, item);
     }
 
-    /** Record what a cupboard held and re-check the clockwise-order inference. */
+    /** One search (item or empty) fixes the whole layout until the next rotation. */
     recordCupboard(key, item) {
         const a = this.alch;
-        const pos = a.order.indexOf(key);
-        if (pos < 0) return;
-
-        a.observations = a.observations.filter((obs) => obs.pos !== pos);
-        a.observations.push({ pos, item });
-        if (!this.cupboardsConsistent(a.dir)) {
-            if (this.cupboardsConsistent(-a.dir)) {
-                a.dir = -a.dir;
-            } else {
-                // Contradiction: the layout shuffled. Keep only the newest fact.
-                a.observations = [{ pos, item }];
-            }
+        const obj = a.cupboards.get(key);
+        const idx = obj ? this.cupboardIndex(obj) : -1;
+        if (idx < 0) return;
+        const predicted = this.predictCupboard(idx);
+        if (predicted !== null && predicted !== item) {
+            this.log(`cupboard ${idx} held ${item}, expected ${predicted}; relearning layout`);
         }
+        a.anchor = { idx, item };
         a.bestCupboard = null;
     }
 
-    predictCupboard(pos, dir) {
-        const a = this.alch;
-        const anchor = a.observations.find((obs) => obs.item !== EMPTY_CUPBOARD);
-        if (!anchor || a.order.length < 5) return null;
-        const item = mod(anchor.item + dir * (pos - anchor.pos), a.order.length);
-        return item < 5 ? item : EMPTY_CUPBOARD;
+    /** Item index 0..4, EMPTY_CUPBOARD, or null while the layout is unknown. */
+    predictCupboard(idx) {
+        const anchor = this.alch.anchor;
+        if (!anchor || idx < 0) return null;
+        return mod(anchor.item + idx - anchor.idx, NUM_CUPBOARDS);
     }
 
-    cupboardsConsistent(dir) {
-        return this.alch.observations.every((obs) => {
-            const predicted = this.predictCupboard(obs.pos, dir);
-            return predicted === null || predicted === obs.item;
-        });
-    }
-
-    /** The cupboard holding the best item if it can be inferred, else the nearest unexplored one. */
+    /** The cupboard holding the best item once the layout is known, else the nearest one. */
     pickCupboard() {
         const a = this.alch;
         const player = this.local();
-        if (!player || a.order.length === 0) return null;
+        if (!player || a.cupboards.size === 0) return null;
 
         if (a.best >= 0) {
-            for (let pos = 0; pos < a.order.length; pos++) {
-                const key = a.order[pos];
-                if (this.predictCupboard(pos, a.dir) === a.best && a.cupboards.has(key)) {
+            for (const [key, obj] of a.cupboards) {
+                if (this.predictCupboard(this.cupboardIndex(obj)) === a.best) {
                     a.bestCupboard = key;
-                    return { key, obj: a.cupboards.get(key) };
+                    return { key, obj };
                 }
             }
         }
         a.bestCupboard = null;
 
-        const explored = new Set(a.observations.map((obs) => a.order[obs.pos]));
-        let candidates = a.order.filter((key) => !explored.has(key) && a.cupboards.has(key));
-        if (candidates.length === 0) {
-            a.observations = [];
-            candidates = a.order.filter((key) => a.cupboards.has(key));
-        }
-        candidates.sort((l, r) => player.distanceTo(a.cupboards.get(l).tile)
-            - player.distanceTo(a.cupboards.get(r).tile));
-        const key = candidates[0];
-        return key ? { key, obj: a.cupboards.get(key) } : null;
+        const nearest = Array.from(a.cupboards.entries())
+            .sort(([, l], [, r]) => player.distanceTo(l.tile) - player.distanceTo(r.tile))[0];
+        return nearest ? { key: nearest[0], obj: nearest[1] } : null;
     }
 
     /** Deposit coins; returns true while the deposit is being worked on. */
@@ -1323,7 +1309,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         e.bonus = this.readBonusShape();
 
         if (this.enchantDragonstones.value && inv.emptySlots > 0) {
-            const dragonstone = titan.queries.groundItems(20).id(ITEM.DRAGONSTONE).nearest();
+            const dragonstone = titan.queries.groundItems(SCAN_RADIUS).id(ITEM.DRAGONSTONE).nearest();
             if (dragonstone) {
                 this.status = "Picking up a dragonstone";
                 if (!this.inProgress("dragonstone", inv.size, 4)) {
@@ -1941,8 +1927,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
                 const bestValue = a.best >= 0 ? a.costs[a.best] : -1;
                 title("Alchemy");
                 line("Best item", a.best >= 0 ? `${ALCH_ITEM_NAMES[a.best]} (${bestValue})` : "Reading prices");
-                const checked = new Set(a.observations.map((obs) => obs.pos)).size;
-                line("Best cupboard", a.bestCupboard ? "Known" : `Searching (${checked}/${a.order.length})`,
+                line("Best cupboard", a.bestCupboard ? "Known" : "Searching (1 search reveals all)",
                     a.bestCupboard ? COLOR.GOOD : COLOR.WARN);
                 line("Coins held", `${inv.count(ITEM.MTA_COINS).toLocaleString()} / ${this.alchDepositAt.value.toLocaleString()}`);
                 line("Coins deposited", this.session.deposited[ROOM.ALCHEMIST].toLocaleString());
@@ -2426,11 +2411,10 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     /** What each cupboard holds: seen (white), inferred (grey), or the target (green). */
     labelCupboards() {
         const a = this.alch;
-        a.order.forEach((key, pos) => {
-            const obj = a.cupboards.get(key);
-            if (!obj) return;
-            const seen = a.observations.find((obs) => obs.pos === pos);
-            const item = seen ? seen.item : this.predictCupboard(pos, a.dir);
+        a.cupboards.forEach((obj, key) => {
+            const idx = this.cupboardIndex(obj);
+            const seen = !!a.anchor && a.anchor.idx === idx;
+            const item = this.predictCupboard(idx);
             if (item === null) {
                 this.tileLabel(obj.tileX, obj.tileY, obj.plane, "?", COLOR.DIM);
                 return;
