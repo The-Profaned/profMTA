@@ -125,6 +125,8 @@ const DIRS = [
 
 const ALCH_COOLDOWN_TICKS = 5;
 const PEACHES_PER_DEPOSIT = 24;   // 8 peaches per point, 3 points max per deposit
+const BONE_BLOCK = 4;             // a bone pile gives 4 of one type, then the next (1 -> 2 -> 3 -> 4 -> 1)
+const BONE_DROP_SPOTANIMS = [520, 521, 522, 523]; // MAGICTRAINING_BONE_DROP1..4 (falling bones, 2 damage)
 const SCAN_RADIUS = 40;
 
 // ---------------------------------------------------------------------------
@@ -276,7 +278,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     name = "[Prof] Mage Training Arena";
     description = "Runs the selected Mage Training Arena room for pizazz points.";
     author = "Prof";
-    version = "0.2.1";
+    version = "0.2.2";
 
     enabled = false;
 
@@ -469,6 +471,15 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         max: 90,
     });
 
+    graveDodge = this.createSetting("boolSetting", {
+        key: "graveDodge",
+        name: "Dodge falling bones",
+        section: this.graveSection,
+        position: 2,
+        default: true,
+        tooltip: "Step off the tile a falling bone is about to land on (it hits for 2).",
+    });
+
     /** Last seen points, persisted so the goal survives restarts. */
     pointsStore = this.createSetting("stringSetting", {
         key: "trackedPoints",
@@ -654,7 +665,14 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             bestCupboard: null,
         };
         this.ench = { phase: "collect", bonus: null, spell: null, spellTick: -100, castSlot: -1, castItem: -1, pile: null };
-        this.grave = { fruitValue: 0, target: 0, bones: 0, peaches: false };
+        this.grave = {
+            fruitValue: 0, target: 0, bones: 0, peaches: false,
+            pile: null, pileKey: null,  // the pile nearest the chute, kept for the whole visit
+            type: 0, run: 0,            // last bone type taken from it (0 = unknown) and how many in a row
+            synced: false,              // true once `run` counts from the start of a 4-bone block
+            counts: null,               // bones held per type last tick
+            dodgeKey: null, dodgeTick: -100,
+        };
     }
 
     onGameTick(tick) {
@@ -670,6 +688,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             this.readPoints();
             this.updateSession();
             this.checkStuck();
+            if (this.currentRoom === ROOM.GRAVEYARD && this.graveDodge.value && this.dodgeFallingBones()) return;
             if (this.sleepTicks > 0) {
                 this.sleepTicks--;
                 return;
@@ -1460,15 +1479,16 @@ class MageTrainingArenaPlugin extends titan.Plugin {
                 "Bring food, or let the plugin keep some bananas/peaches by lowering the eat threshold.");
         }
 
+        const g = this.grave;
         const bones = titan.queries.inventory().ids(...ITEM.BONES).toArray();
+        this.observeBones(bones);
         const fruitValue = bones.reduce((sum, bone) => sum + (BONE_FRUIT[bone.id] || 0), 0);
         const usePeaches = this.useBonesToPeaches();
         const capacity = inv.emptySlots + bones.length;
-        const target = Math.min(usePeaches ? PEACHES_PER_DEPOSIT : capacity, capacity);
-        Object.assign(this.grave, { fruitValue, target, bones: bones.length, peaches: usePeaches });
+        const target = usePeaches ? Math.min(PEACHES_PER_DEPOSIT, capacity) : capacity;
+        Object.assign(g, { fruitValue, target, bones: bones.length, peaches: usePeaches });
 
-        // Stop grabbing once another bone (worth up to 4 fruit) could overflow the inventory.
-        if (bones.length > 0 && (fruitValue >= target || fruitValue + 4 > capacity || inv.emptySlots === 0)) {
+        if (bones.length > 0 && this.graveShouldCast(fruitValue, capacity, usePeaches)) {
             if (this.awaiting("bones-to-fruit", false, 5)) {
                 this.status = "Casting";
                 return;
@@ -1488,7 +1508,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             return;
         }
 
-        const pile = titan.queries.objects(SCAN_RADIUS).ids(...OBJ.BONE_PILES).nearest();
+        const pile = this.gravePile();
         if (!pile) {
             this.status = "No bone piles found";
             this.walkFallback(COORDS.roomCenters[ROOM.GRAVEYARD]);
@@ -1496,9 +1516,120 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             return;
         }
         this.status = `Grabbing bones (${fruitValue}/${target} fruit)`;
-        if (!this.inProgress("grab-bones", bones.length, 3)) {
-            if (this.interactPreferred(pile, ["Grab"])) this.track("grab-bones", bones.length);
+        // A click loots a bone every tick, so click every tick until the threshold is reached.
+        if (this.interactPreferred(pile, ["Grab"])) this.track("grab-bones", bones.length);
+    }
+
+    /**
+     * When to stop grabbing and cast. Peaches: once the total reaches 24, the
+     * 3-point cap per deposit. Bananas have no reachable cap (16 per point), so
+     * fill the inventory: cast when the next bone might not fit as fruit.
+     */
+    graveShouldCast(fruitValue, capacity, usePeaches) {
+        if (fruitValue + (this.nextBoneValue() || 4) > capacity) return true;
+        return usePeaches && fruitValue >= PEACHES_PER_DEPOSIT;
+    }
+
+    /** Fruit value of the pile's next bone, or 0 while its place in the rotation is unknown. */
+    nextBoneValue() {
+        const g = this.grave;
+        if (!g.synced) return 0;
+        return g.run < BONE_BLOCK ? g.type : g.type % 4 + 1;
+    }
+
+    /** Learn the pile's place in its rotation from the bones that just landed in the inventory. */
+    observeBones(bones) {
+        const g = this.grave;
+        const counts = [0, 0, 0, 0, 0];
+        bones.forEach((bone) => { counts[BONE_FRUIT[bone.id] || 0]++; });
+        const prev = g.counts;
+        g.counts = counts;
+        if (!prev) return;
+        const gained = [1, 2, 3, 4].filter((type) => counts[type] > prev[type]);
+        if (gained.length > 1) {
+            // Several types in one tick: the order is unclear, so relearn.
+            Object.assign(g, { type: 0, run: 0, synced: false });
+        } else if (gained.length === 1) {
+            const type = gained[0];
+            for (let i = prev[type]; i < counts[type]; i++) this.recordBone(type);
         }
+    }
+
+    recordBone(type) {
+        const g = this.grave;
+        if (type !== g.type) {
+            // A new type starts a block; the very first bone seen could be anywhere in one.
+            Object.assign(g, { synced: g.type !== 0, type, run: 1 });
+            return;
+        }
+        g.run++;
+        if (g.run === BONE_BLOCK) g.synced = true;
+        else if (g.run > BONE_BLOCK) Object.assign(g, { synced: false, run: 1 });
+    }
+
+    /** The bone pile nearest a food chute (the wiki's route), kept for the whole visit. */
+    gravePile() {
+        const g = this.grave;
+        const piles = titan.queries.objects(SCAN_RADIUS).ids(...OBJ.BONE_PILES).toArray();
+        if (piles.length === 0) return null;
+        const locked = g.pileKey && piles.find((pile) => tileKey(pile.tile) === g.pileKey);
+        if (locked) return (g.pile = locked);
+
+        const chutes = titan.queries.objects(SCAN_RADIUS).id(OBJ.FOOD_CHUTE).toArray();
+        const player = this.local();
+        const toChute = (pile) => Math.min(...chutes.map((chute) => chebyshev(pile.tile, chute.tile)));
+        const toPlayer = (pile) => (player ? player.distanceTo(pile.tile) : 0);
+        piles.sort((l, r) => (chutes.length ? toChute(l) - toChute(r) : 0) || toPlayer(l) - toPlayer(r));
+        g.pile = piles[0];
+        g.pileKey = tileKey(g.pile.tile);
+        Object.assign(g, { type: 0, run: 0, synced: false });
+        this.crumb(`Using the bone pile at ${g.pileKey}`, "info");
+        return g.pile;
+    }
+
+    /**
+     * Falling bones hit the tile they land on for 2 damage. Their graphic shows
+     * on the tile before the hit, so when one is on the player's tile, step to
+     * a free neighbour (next to the pile when possible). Returns true while dodging.
+     */
+    dodgeFallingBones() {
+        const player = this.local();
+        if (!player) return false;
+        const drops = titan.queries.graphicsObjects()
+            .where((drop) => BONE_DROP_SPOTANIMS.includes(drop.spotAnimId)).toArray();
+        if (drops.length === 0) return false;
+        const danger = new Set(drops.map((drop) => `${drop.worldX},${drop.worldY}`));
+        if (!danger.has(`${player.worldX},${player.worldY}`)) return false;
+
+        const g = this.grave;
+        const drop = drops.find((d) => d.worldX === player.worldX && d.worldY === player.worldY);
+        const key = `${drop.worldX},${drop.worldY},${drop.startCycle}`;
+        if (g.dodgeKey === key && this.tick - g.dodgeTick < 2) return true;
+
+        const here = player.tile;
+        const collisions = titan.state.collisions;
+        const pile = g.pile && g.pile.exists ? g.pile.tile : null;
+        const steps = [];
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                if (dx === 0 && dy === 0) continue;
+                if (danger.has(`${player.worldX + dx},${player.worldY + dy}`)) continue;
+                if (collisions.isBlocked(here.plane, here.x, here.y, dx, dy)) continue;
+                const tile = { x: here.x + dx, y: here.y + dy, plane: here.plane };
+                if (!this.isWalkable(tile.plane, tile.x, tile.y)) continue;
+                steps.push({ tile, toPile: pile ? chebyshev(tile, pile) : 0, diagonal: dx !== 0 && dy !== 0 });
+            }
+        }
+        if (steps.length === 0) return false;
+        steps.sort((l, r) => l.toPile - r.toPile || l.diagonal - r.diagonal);
+        const step = steps[0].tile;
+        this.status = "Dodging a falling bone";
+        this.action(`Dodge to ${step.x},${step.y}`, titan.state.walk.toScene(step.x, step.y));
+        g.dodgeKey = key;
+        g.dodgeTick = this.tick;
+        this.session.dodges++;
+        this.pending = null;
+        return true;
     }
 
     useBonesToPeaches() {
@@ -1520,7 +1651,9 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     }
 
     depositFruit() {
-        return this.depositInto(OBJ.FOOD_CHUTE, "Depositing fruit", this.fruitCount(), COORDS.graveyardChute);
+        const pile = this.grave.pile;
+        const chute = pile ? titan.queries.objects(SCAN_RADIUS).id(OBJ.FOOD_CHUTE).nearestTo(pile.tile) : null;
+        return this.depositInto(OBJ.FOOD_CHUTE, "Depositing fruit", this.fruitCount(), COORDS.graveyardChute, chute);
     }
 
     // ---- Shared actions -----------------------------------------------------
@@ -1528,9 +1661,9 @@ class MageTrainingArenaPlugin extends titan.Plugin {
      * Use the "Deposit" option of `objectId` until `amount` stops dropping.
      * Returns true while it acted (or is waiting on the deposit).
      */
-    depositInto(objectId, label, amount, fallback) {
+    depositInto(objectId, label, amount, fallback, preferred = null) {
         this.status = label;
-        const target = titan.queries.objects(SCAN_RADIUS).id(objectId).nearest();
+        const target = preferred || titan.queries.objects(SCAN_RADIUS).id(objectId).nearest();
         if (!target) {
             if (!this.walkFallback(fallback)) this.status = `${label}: target not in view`;
             this.wait(2, 3);
@@ -1699,6 +1832,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             mazes: 0,
             casts: 0,
             eaten: 0,
+            dodges: 0,
         };
     }
 
@@ -1953,8 +2087,13 @@ class MageTrainingArenaPlugin extends titan.Plugin {
                 line("Hitpoints", `${hp} / ${maxHp}`, low ? COLOR.BAD : COLOR.TEXT);
                 line("Spell", g.peaches ? "Bones to Peaches" : "Bones to Bananas");
                 line("Bones", `${g.bones} held (${g.fruitValue}/${g.target} fruit)`);
+                const next = this.nextBoneValue();
+                line("Pile", !g.pile ? "-" : next
+                    ? `next: ${next}-fruit bone (${g.run < BONE_BLOCK ? BONE_BLOCK - g.run : BONE_BLOCK} of that type left)`
+                    : "learning rotation");
                 line("Fruit", `${this.fruitCount()} held, ${this.session.deposited[ROOM.GRAVEYARD].toLocaleString()} deposited`);
                 line("Food eaten", this.session.eaten);
+                line("Bones dodged", this.session.dodges);
                 break;
             }
         }
@@ -2405,6 +2544,11 @@ class MageTrainingArenaPlugin extends titan.Plugin {
                 this.tileLabel(pile.tileX, pile.tileY, pile.plane,
                     `${capitalize(shape || "shapes")}${bonus ? " (bonus)" : ""}`, bonus ? COLOR.GOOD : COLOR.TEXT);
             }
+        } else if (this.currentRoom === ROOM.GRAVEYARD && this.grave.pile && this.grave.pile.exists) {
+            const pile = this.grave.pile;
+            overlay.tileObjectHull(pile, COLOR.ACCENT, 0x339B7BFF);
+            const next = this.nextBoneValue();
+            if (labels) this.tileLabel(pile.tileX, pile.tileY, pile.plane, next ? `Next: ${next}` : "Bones", COLOR.TEXT);
         }
     }
 

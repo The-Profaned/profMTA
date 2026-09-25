@@ -36,7 +36,7 @@ Set up the inventory and equipment for the room before starting.
 | Telekinetic | Law runes, air (or air staff) | Solves the maze by breadth-first search over statue slides, stands on the matching side, casts Telekinetic Grab, and starts a new maze when it's solved. |
 | Alchemist | Nature runes, fire (or fire staff) | Reads the price table, searches one cupboard to learn the layout (the 6 cupboards cycle through the items by object id, as in RuneLite's MTA plugin), takes the 30-coin item, alchs it, drops items below the minimum value, and deposits coins. |
 | Enchanting | Cosmic runes plus the staff/runes for the spell | Fills the inventory from the bonus-shape pile, picks up dragonstones, enchants everything, and deposits orbs. |
-| Graveyard | Nature runes, earth/water (or mud staff), food | Grabs bones up to a full deposit's worth of fruit, casts Bones to Peaches/Bananas, deposits, and eats below the HP threshold. |
+| Graveyard | Nature runes, earth/water (or mud staff), food | Sticks to the bone pile nearest the food chute and clicks it every tick. Peaches stops once the bones are worth 24 (the 3-point cap); Bananas fills the inventory. It tracks the pile's 4-bones-per-type rotation so it knows whether the next bone still fits. It then casts, deposits, dodges falling bones, and eats only below the HP threshold. |
 
 **Auto** mode stays in a room until its goal is met, then moves to the room
 furthest from its goal. The inventory must hold the supplies for every room.
@@ -58,7 +58,8 @@ The in-game overlay panel (Alt-drag to move) shows:
   inside that room, so walking and Auto-mode room swaps don't skew it.
 - **Room details:** maze next grab and grabs to finish; alchemy best item,
   cupboard search progress and coins; enchanting bonus shape, phase, spell and
-  orbs; graveyard HP, spell, bones/fruit and food eaten. Also the room's rune
+  orbs; graveyard HP, spell, bones/fruit, next bone from the pile, food eaten
+  and bones dodged. Also the room's rune
   count and cast count.
 - **Goals:** all four rooms against their goals, and **Last progress**, which
   turns yellow or red if points and XP stop going up.
@@ -115,3 +116,8 @@ live client:
   item after slot n-1's, and one slot is empty. One search (or the "You found:"
   chat line) reveals every cupboard until the next price rotation.
 - **Graveyard deposit cap:** assumes 3 points per deposit (24 peaches).
+- **Graveyard bone piles:** assumes a click loots a bone every tick and that each
+  pile keeps its own rotation (the wiki says to use a single pile). The HUD "Pile"
+  line shows the predicted next bone, so a wrong guess is easy to spot. Varbits
+  1500-1502/1507 (`MAGICTRAINING_GRAVE_BONE*COUNT`) may hold the rotation
+  directly, but that isn't confirmed.
