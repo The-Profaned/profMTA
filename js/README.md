@@ -49,9 +49,8 @@ sessions. *Point goals → Goal mode* picks how the goals are set:
   cost. Buying one lowers the goal by as much as your points drop, so progress
   doesn't go backwards. Ownership comes from the collection log's Magic Training
   Arena page (open it once; the plugin reads it whenever it's open) and from
-  reward items seen in the inventory. The rune pouch and Bones to Peaches aren't
-  on the log, so each has its own opt-in; Bones to Peaches is detected from its
-  unlock varbit. The side panel's **Rewards** tab lists every reward, whether
+  reward items seen in the inventory. Bones to Peaches is also detected from its
+  unlock varbit. The rune pouch isn't on the log, so it has its own opt-in. The side panel's **Rewards** tab lists every reward, whether
   you own it, and its cost.
 
 ## HUD

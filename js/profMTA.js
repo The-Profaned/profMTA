@@ -54,8 +54,9 @@ const REWARD_POINTS = [2825, 3275, 29000, 2825];
  * Rewards shop (wiki: Mage Training Arena shop stock). `cost` is in ROOM order
  * [Telekinetic, Alchemist, Enchanting, Graveyard]; wand prices are upgrades
  * (the wand below is handed in). `log` = on the collection log's Magic
- * Training Arena page; the others count toward the green-log goal only when
- * their `optional` setting is on. The totals are REWARD_POINTS.
+ * Training Arena page (Bones to Peaches shows there as a peach); the rune pouch
+ * isn't, so it counts toward the green-log goal only when its `optional`
+ * setting is on. The totals are REWARD_POINTS.
  */
 const REWARDS = [
     { key: "wand1", name: "Beginner wand", item: 6908, cost: [30, 30, 300, 30], log: true },
@@ -68,10 +69,11 @@ const REWARDS = [
     { key: "boots", name: "Infinity boots", item: 6920, cost: [120, 120, 1200, 120], log: true },
     { key: "gloves", name: "Infinity gloves", item: 6922, cost: [175, 225, 1500, 175], log: true },
     { key: "book", name: "Mage's book", item: 6889, cost: [500, 550, 6000, 500], log: true },
-    { key: "peaches", name: "Bones to Peaches", item: null, cost: [200, 300, 2000, 200], log: false, optional: "goalPeaches" },
+    { key: "peaches", name: "Bones to Peaches", item: 6883, cost: [200, 300, 2000, 200], log: true },
     { key: "pouch", name: "Rune pouch", item: 12791, cost: [150, 200, 1500, 150], log: false, optional: "goalRunePouch" },
 ];
-const REWARD_ITEMS = REWARDS.filter((reward) => reward.item !== null).map((reward) => reward.item);
+// Rewards whose item in the inventory means it's owned (a peach is just fruit, not the unlock).
+const REWARD_ITEMS = REWARDS.filter((reward) => reward.key !== "peaches").map((reward) => reward.item);
 const GOAL_MODE = Object.freeze({ MANUAL: 0, GREEN_LOG: 1 });
 
 const OBJ = Object.freeze({
@@ -328,7 +330,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     name = "[Prof] Mage Training Arena";
     description = "Runs the selected Mage Training Arena room for pizazz points.";
     author = "Prof";
-    version = "0.5.1";
+    version = "0.5.2";
 
     enabled = false;
 
@@ -428,15 +430,6 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         position: 5,
         default: false,
         tooltip: "The rune pouch isn't on the collection log; count its cost until one is seen in the inventory.",
-    });
-
-    goalPeaches = this.createSetting("boolSetting", {
-        key: "goalPeaches",
-        name: "Green log: include Bones to Peaches",
-        section: this.goalsSection,
-        position: 6,
-        default: false,
-        tooltip: "The Bones to Peaches unlock isn't on the collection log; count its cost until the spell is unlocked.",
     });
 
     /** Owned rewards (keys) and whether the collection log has been read, persisted. */
