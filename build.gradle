@@ -135,8 +135,22 @@ tasks.register('copyJsPluginToTitanDev') {
     doLast copyJsPluginToGenerations
 }
 
-// `gradlew build` while the dev tab is open pushes JS edits for hot reload.
+// Same copy as js/deploy.ps1: the normal TitanClient plugin folder, for
+// running the plugin outside a dev session. Override with -PtitanPluginsDir.
+def titanPluginsDir = providers.gradleProperty('titanPluginsDir')
+    .orElse("${System.getProperty('user.home')}/.titanclient/plugins")
+    .get()
+
+tasks.register('deployJsPlugin', Copy) {
+    from jsPluginSources
+    into titanPluginsDir
+    doLast { logger.lifecycle("Deployed JS plugin(s) to ${titanPluginsDir}") }
+}
+
+// `gradlew build` deploys to the plugin folder and, while the dev tab is open,
+// pushes JS edits for hot reload.
 tasks.named('build') {
+    dependsOn 'deployJsPlugin'
     doLast copyJsPluginToGenerations
 }
 

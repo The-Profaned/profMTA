@@ -50,6 +50,30 @@ const ROOM_NAMES = ["Telekinetic", "Alchemist", "Enchanting", "Graveyard"];
 /** Pizazz points needed to buy every reward, per room (OSRS wiki). */
 const REWARD_POINTS = [2825, 3275, 29000, 2825];
 
+/**
+ * Rewards shop (wiki: Mage Training Arena shop stock). `cost` is in ROOM order
+ * [Telekinetic, Alchemist, Enchanting, Graveyard]; wand prices are upgrades
+ * (the wand below is handed in). `log` = on the collection log's Magic
+ * Training Arena page; the others count toward the green-log goal only when
+ * their `optional` setting is on. The totals are REWARD_POINTS.
+ */
+const REWARDS = [
+    { key: "wand1", name: "Beginner wand", item: 6908, cost: [30, 30, 300, 30], log: true },
+    { key: "wand2", name: "Apprentice wand", item: 6910, cost: [60, 60, 600, 60], log: true },
+    { key: "wand3", name: "Teacher wand", item: 6912, cost: [150, 200, 1500, 150], log: true },
+    { key: "wand4", name: "Master wand", item: 6914, cost: [240, 240, 2400, 240], log: true },
+    { key: "hat", name: "Infinity hat", item: 6918, cost: [350, 400, 3000, 350], log: true },
+    { key: "top", name: "Infinity top", item: 6916, cost: [400, 450, 4000, 400], log: true },
+    { key: "bottoms", name: "Infinity bottoms", item: 6924, cost: [450, 500, 5000, 450], log: true },
+    { key: "boots", name: "Infinity boots", item: 6920, cost: [120, 120, 1200, 120], log: true },
+    { key: "gloves", name: "Infinity gloves", item: 6922, cost: [175, 225, 1500, 175], log: true },
+    { key: "book", name: "Mage's book", item: 6889, cost: [500, 550, 6000, 500], log: true },
+    { key: "peaches", name: "Bones to Peaches", item: null, cost: [200, 300, 2000, 200], log: false, optional: "goalPeaches" },
+    { key: "pouch", name: "Rune pouch", item: 12791, cost: [150, 200, 1500, 150], log: false, optional: "goalRunePouch" },
+];
+const REWARD_ITEMS = REWARDS.filter((reward) => reward.item !== null).map((reward) => reward.item);
+const GOAL_MODE = Object.freeze({ MANUAL: 0, GREEN_LOG: 1 });
+
 const OBJ = Object.freeze({
     // MAGICTRAINING_TELEDOOR / ALCHEMDOOR / ENCHANTDOOR / GRAVEDOOR, indexed by ROOM.
     PORTALS: [23673, 23675, 23674, 23676],
@@ -102,6 +126,8 @@ const WIDGET = Object.freeze({
     ROOM_POINTS: [12976134, 12713990, 12779526, 12845062],
     // MagictrainingMain *_POINTS (lobby overview), indexed by ROOM.
     LOBBY_POINTS: [36241418, 36241419, 36241420, 36241421],
+    CLOG_GROUP: 621,               // Collection log
+    CLOG_ITEMS: 40697893,          // Collection.ITEMS_CONTENTS: the open page's item slots
     ALCH_ITEM: [12713991, 12713992, 12713993, 12713994, 12713995],
     ALCH_COST: [12713996, 12713997, 12713998, 12713999, 12714000],
 });
@@ -128,6 +154,30 @@ const PEACHES_PER_DEPOSIT = 24;   // 8 peaches per point, 3 points max per depos
 const BONE_BLOCK = 4;             // a bone pile gives 4 of one type, then the next (1 -> 2 -> 3 -> 4 -> 1)
 const BONE_DROP_SPOTANIMS = [520, 521, 522, 523]; // MAGICTRAINING_BONE_DROP1..4 (falling bones, 2 damage)
 const SCAN_RADIUS = 40;
+const SCENE_RADIUS = 104;         // the whole loaded scene
+
+// World hopping (Enchanting dragonstone mode)
+const ENCH_MODE = Object.freeze({ SHAPES: 0, DRAGONSTONES: 1 });
+// RuneLite WorldType bits to avoid: PVP, BOUNTY, PVP_ARENA, SKILL_TOTAL, QUEST_SPEEDRUNNING,
+// HIGH_RISK, LAST_MAN_STANDING, BETA, NOSAVE_MODE, TOURNAMENT, FRESH_START_WORLD, DEADMAN, SEASONAL.
+const HOP_EXCLUDED_FLAGS = (1 << 2) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10) | (1 << 14)
+    | (1 << 16) | (1 << 25) | (1 << 26) | (1 << 27) | (1 << 29) | (1 << 30);
+const HOP_EXCLUDED_ACTIVITY = /pvp|high risk|deadman|skill total|beta|tournament|speedrun|last man|fresh start|seasonal|bounty|leagues/i;
+const HOP_SETTLE_TICKS = 3;       // let ground items load on the new world before looking
+const HOP_TIMEOUT_TICKS = 30;
+// The six dragonstone spawns (wiki, world tiles), in order round the Enchanting
+// Chamber, clockwise from the north-west.
+const DRAGONSTONE_RING = [
+    { x: 3354, y: 9646 },   // north-west
+    { x: 3373, y: 9651 },   // north-east
+    { x: 3374, y: 9643 },   // east
+    { x: 3375, y: 9633 },   // south-east
+    { x: 3359, y: 9632 },   // south
+    { x: 3353, y: 9635 },   // south-west
+];
+const RECENT_WORLDS = 10;         // don't hop back to these (dragonstones respawn slowly)
+const BAD_WORLD_TICKS = 500;      // skip a world the client refused to hop to for ~5 minutes
+const HOP_FAIL_REPORT = 3;        // report after this many refused hops in a row
 
 // ---------------------------------------------------------------------------
 // HUD / session stats
@@ -278,7 +328,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     name = "[Prof] Mage Training Arena";
     description = "Runs the selected Mage Training Arena room for pizazz points.";
     author = "Prof";
-    version = "0.2.2";
+    version = "0.5.1";
 
     enabled = false;
 
@@ -296,7 +346,8 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     goalsSection = this.createSection("goals", "Point goals", {
         position: 1,
         closedByDefault: true,
-        description: "Points to earn per room. Defaults are the totals for every reward.",
+        description: "Manual: the points to earn per room below (defaults are every reward). "
+            + "Green log: what the rewards missing from your collection log still cost.",
     });
     teleSection = this.createSection("tele", "Telekinetic Theatre", { position: 2, closedByDefault: true });
     alchSection = this.createSection("alch", "Alchemists' Playground", { position: 3, closedByDefault: true });
@@ -355,6 +406,49 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         max: room === ROOM.ENCHANTING ? 32000 : room === ROOM.ALCHEMIST ? 16000 : 8000,
     }));
 
+    goalMode = this.createSetting("comboSetting", {
+        key: "goalMode",
+        name: "Goal mode",
+        section: this.goalsSection,
+        position: 4,
+        default: GOAL_MODE.MANUAL,
+        choices: [
+            { value: GOAL_MODE.MANUAL, label: "Manual (goals above)" },
+            { value: GOAL_MODE.GREEN_LOG, label: "Green log (collection log)" },
+        ],
+        tooltip: "Green log: each room's goal is what the rewards you don't own yet cost, so buying one "
+            + "lowers the goal as much as your points. Open the collection log's Magic Training Arena "
+            + "page once so the plugin can read it.",
+    });
+
+    goalRunePouch = this.createSetting("boolSetting", {
+        key: "goalRunePouch",
+        name: "Green log: include rune pouch",
+        section: this.goalsSection,
+        position: 5,
+        default: false,
+        tooltip: "The rune pouch isn't on the collection log; count its cost until one is seen in the inventory.",
+    });
+
+    goalPeaches = this.createSetting("boolSetting", {
+        key: "goalPeaches",
+        name: "Green log: include Bones to Peaches",
+        section: this.goalsSection,
+        position: 6,
+        default: false,
+        tooltip: "The Bones to Peaches unlock isn't on the collection log; count its cost until the spell is unlocked.",
+    });
+
+    /** Owned rewards (keys) and whether the collection log has been read, persisted. */
+    rewardsStore = this.createSetting("stringSetting", {
+        key: "ownedRewards",
+        name: "Owned rewards",
+        section: this.goalsSection,
+        position: 99,
+        default: "",
+        hidden: true,
+    });
+
     teleSideOffset = this.createSetting("intSetting", {
         key: "teleSideOffset",
         name: "Stand distance outside maze",
@@ -389,24 +483,26 @@ class MageTrainingArenaPlugin extends titan.Plugin {
 
     alchMinValue = this.createSetting("intSetting", {
         key: "alchMinValue",
-        name: "Drop items worth less than",
+        name: "Don't alch spares worth less than",
         section: this.alchSection,
         position: 1,
         default: 15,
         min: 0,
         max: 30,
-        tooltip: "Held items worth fewer coins than this (after a price rotation) are dropped instead of alched.",
+        tooltip: "Spare items (above the reserve, not the best item) worth fewer coins than this are kept, "
+            + "not alched. Items are only dropped to make room for the next take.",
     });
 
-    alchHoldCount = this.createSetting("intSetting", {
-        key: "alchHoldCount",
-        name: "Best items to hold",
+    alchReserve = this.createSetting("intSetting", {
+        key: "alchReserve",
+        name: "Reserve of each item",
         section: this.alchSection,
         position: 2,
-        default: 1,
-        min: 1,
+        default: 2,
+        min: 0,
         max: 5,
-        tooltip: "How many of the best item to take from its cupboard before stopping to alch.",
+        tooltip: "Keep this many of every item type, so when the prices rotate there's something to alch "
+            + "while running to the new best cupboard. The best item is taken 5 at a time once this few are left.",
     });
 
     alchDepositAt = this.createSetting("intSetting", {
@@ -446,6 +542,39 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         section: this.enchSection,
         position: 2,
         default: true,
+    });
+
+    enchantMode = this.createSetting("comboSetting", {
+        key: "enchantMode",
+        name: "Mode",
+        section: this.enchSection,
+        position: 3,
+        default: ENCH_MODE.SHAPES,
+        choices: [
+            { value: ENCH_MODE.SHAPES, label: "Shapes" },
+            { value: ENCH_MODE.DRAGONSTONES, label: "Dragonstones + world hop" },
+        ],
+        tooltip: "Dragonstones: take every dragonstone in the room (double points), enchant them, "
+            + "deposit the orbs, then hop worlds for fresh spawns.",
+    });
+
+    hopSameRegion = this.createSetting("boolSetting", {
+        key: "hopSameRegion",
+        name: "Hop within my region",
+        section: this.enchSection,
+        position: 4,
+        default: true,
+        tooltip: "Only hop to worlds in the same region as the current one (lower ping).",
+    });
+
+    hopMinSeconds = this.createSetting("intSetting", {
+        key: "hopMinSeconds",
+        name: "Min seconds between hops",
+        section: this.enchSection,
+        position: 5,
+        default: 6,
+        min: 3,
+        max: 60,
     });
 
     graveSpell = this.createSetting("comboSetting", {
@@ -575,6 +704,13 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     ench = null;
     grave = null;
     session = this.newSession();
+    owned = new Set();      // reward keys the player has (collection log, inventory, unlock varbit)
+    logRead = false;        // the collection log's MTA page has been read at least once
+    hopping = null;         // { from, to, tick, arrived } while a world hop is in progress
+    lastHopTick = -1000;
+    recentWorlds = [];
+    badWorlds = new Map();  // world id -> tick until which it's skipped
+    hopFails = 0;
     events = [];
     crumbs = [];            // last CRUMB_LIMIT actions, newest last
     reports = [];           // newest first
@@ -608,6 +744,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     // ---- Lifecycle ----------------------------------------------------------
     onEnable() {
         this.loadPoints();
+        this.loadRewards();
         this.resetState();
         this.log("enabled");
     }
@@ -641,6 +778,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     resetState() {
         this.sleepTicks = 0;
         this.pending = null;
+        this.hopping = null;
         this.currentRoom = null;
         this.targetRoom = null;
         this.errorCount = 0;
@@ -652,6 +790,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         this.tele = {
             maze: null, dir: null, standTile: null, castFrom: null, lastTile: null, settledTick: 0,
             guardianTile: null, moves: null, solved: false,
+            next: null,             // { dir, tile, walked }: side for the grab after the one in flight
         };
         this.alch = {
             signature: "",
@@ -659,12 +798,15 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             best: -1,
             cupboards: new Map(),   // world key -> live TileObject
             anchor: null,           // { idx, item }: one searched cupboard's contents
-            pendingSearch: null,
+            pendingSearch: null,    // { key, item, action, tick, start } while a cupboard click is being answered
+            lastCounts: null,       // alchemy items held per type last tick
             emptyTick: -1,
             lastAlchTick: -100,
             bestCupboard: null,
         };
-        this.ench = { phase: "collect", bonus: null, spell: null, spellTick: -100, castSlot: -1, castItem: -1, pile: null };
+        this.ench = { phase: "collect", bonus: null, spell: null, spellTick: -100, castSlot: -1, castItem: -1, pile: null, pileKey: null,
+            stones: null, runCastTick: -100,
+            sweep: null };          // { dir: +1 clockwise / -1 anticlockwise / 0 unset, index, target } on DRAGONSTONE_RING
         this.grave = {
             fruitValue: 0, target: 0, bones: 0, peaches: false,
             pile: null, pileKey: null,  // the pile nearest the chute, kept for the whole visit
@@ -677,6 +819,13 @@ class MageTrainingArenaPlugin extends titan.Plugin {
 
     onGameTick(tick) {
         this.tick = tick;
+        if (titan.state.login.isWorldReady) {
+            try {
+                this.trackRewards();
+            } catch (error) {
+                this.reportException(error);
+            }
+        }
         if (!this.running) return;
 
         if (!titan.state.login.isWorldReady) {
@@ -736,6 +885,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
 
     // ---- Main loop ----------------------------------------------------------
     loop() {
+        if (this.hopping && this.waitForHop()) return;
         const current = this.detectRoom();
         if (current !== this.currentRoom) {
             this.log(`room: ${this.roomName(this.currentRoom)} -> ${this.roomName(current)}`);
@@ -847,7 +997,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         const guardian = this.findGuardian();
         if (!guardian) {
             this.status = "Looking for the maze guardian";
-            this.walkFallback(COORDS.roomCenters[ROOM.TELEKINETIC]);
+            if (!this.walkTowardMaze()) this.walkFallback(COORDS.roomCenters[ROOM.TELEKINETIC]);
             this.wait(2, 3);
             return;
         }
@@ -863,6 +1013,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
                 t.maze = null;
                 t.standTile = null;
                 t.moves = null;
+                t.next = null;
                 this.wait(3, 5);
             }
             return;
@@ -878,6 +1029,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         }
         if (this.guardianIs(guardian, NPC_ID.GUARDIAN_MOVING) || this.tick - t.settledTick < 1) {
             this.status = "Guardian sliding";
+            this.teleRunAhead();
             return;
         }
 
@@ -914,6 +1066,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             this.status = "No route found - resetting the maze";
             if (this.interactPreferred(guardian, ["Reset"])) {
                 t.maze = null;
+                t.next = null;
                 this.wait(3, 5);
             }
             return;
@@ -922,8 +1075,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         const player = this.local();
         if (!player) return;
         const p = player.tile;
-        // Out of spell range: pick the side tile nearest the guardian instead.
-        t.standTile = this.mazeStandTile(t.maze, dir, chebyshev(p, g) > 10 ? g : p);
+        t.standTile = this.pickStandTile(t.maze, solution, p, g);
 
         const onSide = this.onMazeSide(t.maze, dir, p);
         const tooFar = t.standTile && chebyshev(p, g) > 10 && tileKey(p) !== tileKey(t.standTile);
@@ -934,6 +1086,12 @@ class MageTrainingArenaPlugin extends titan.Plugin {
                 return;
             }
             this.status = `Moving to the ${dir.name} side`;
+            // Already running there from the last grab: let that run finish.
+            const ahead = t.next && t.next.walked && t.next.dir === dir;
+            if (ahead && !player.isStationary) {
+                t.standTile = t.next.tile;
+                return;
+            }
             const walkKey = `tele-walk:${tileKey(t.standTile)}`;
             if (!this.inProgress(walkKey, tileKey(p), 3)) {
                 this.action(`Walk to the ${dir.name} side`, titan.state.walk.toScene(t.standTile.x, t.standTile.y));
@@ -947,9 +1105,73 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             guardian.castOn(titan.utils.magic.Standard.TELEKINETIC_GRAB))) {
             this.session.casts++;
             t.castFrom = tileKey(g);
+            t.next = this.planNextGrab(t.maze, g, dir, p);
             this.track("telegrab", t.castFrom);
-            this.wait(1, 2);
         }
+    }
+
+    /**
+     * Where to stand for the grab after this one: slide the guardian to where
+     * it will stop, solve from there, and pick that side's stand tile (see
+     * pickStandTile). Null when there is nothing to run to.
+     */
+    planNextGrab(maze, from, dir, player) {
+        const landing = this.slide(maze, from.x, from.y, dir);
+        if (maze.finish && landing.x === maze.finish.x && landing.y === maze.finish.y) return null;
+        const solution = this.solveMaze(maze, landing);
+        if (!solution) return null;
+        const landingTile = { x: landing.x, y: landing.y, plane: maze.plane };
+        if (this.onMazeSide(maze, solution.dir, player) && chebyshev(player, landingTile) <= 10) return null;
+        const tile = this.pickStandTile(maze, solution, player, landingTile);
+        return tile ? { dir: solution.dir, tile, walked: false } : null;
+    }
+
+    /** While the guardian slides from a grab, run to the next grab's side so it can be cast on arrival. */
+    teleRunAhead() {
+        const t = this.tele;
+        const next = t.next;
+        if (!next || next.walked || !t.castFrom) return;
+        next.walked = true;
+        t.standTile = next.tile;
+        this.status = `Guardian sliding - running to the ${next.dir.name} side`;
+        this.action(`Run ahead to the ${next.dir.name} side`, titan.state.walk.toScene(next.tile.x, next.tile.y));
+    }
+
+    /**
+     * The guardian can be far from where the room starts you, out of view.
+     * Walk to the nearest maze wall to bring it into range; if it still isn't
+     * in view from there, head for the middle of the walls in view.
+     * False when no maze wall is loaded either.
+     */
+    walkTowardMaze() {
+        const player = this.local();
+        if (!player) return false;
+        const walls = titan.queries.objects(SCENE_RADIUS).id(OBJ.MAZE_WALL).toArray();
+        if (walls.length === 0) return false;
+        if (!player.isStationary) return true;
+
+        const p = player.tile;
+        walls.sort((l, r) => chebyshev(p, l.tile) - chebyshev(p, r.tile));
+        let target = walls[0].tile;
+        if (chebyshev(p, target) <= 2) {
+            const mean = (pick) => Math.round(walls.reduce((sum, wall) => sum + pick(wall.tile), 0) / walls.length);
+            target = { x: mean((tile) => tile.x), y: mean((tile) => tile.y), plane: p.plane };
+        }
+        const tile = this.walkableNear(target, p) || target;
+        return this.action(`Walk toward the maze (${tile.x},${tile.y})`, titan.state.walk.toScene(tile.x, tile.y));
+    }
+
+    /** `target` or its walkable neighbour closest to `origin`; null when all are blocked. */
+    walkableNear(target, origin) {
+        let best = null;
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                const tile = { x: target.x + dx, y: target.y + dy, plane: target.plane };
+                if (!this.isWalkable(tile.plane, tile.x, tile.y)) continue;
+                if (!best || chebyshev(tile, origin) < chebyshev(best, origin)) best = tile;
+            }
+        }
+        return best;
     }
 
     /** The maze statue, whether the host reports its id directly or as a morph transform. */
@@ -1012,26 +1234,29 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     }
 
     /**
-     * Breadth-first search over slides. Returns the first direction of a
-     * shortest solution and its length in grabs, or null when unsolvable.
+     * Breadth-first search over slides. Returns a shortest solution as its
+     * grab directions (`path`), with the first one and the count broken out,
+     * or null when unsolvable.
      */
     solveMaze(maze, start) {
         const goal = `${maze.finish.x},${maze.finish.y}`;
         const startKey = `${start.x},${start.y}`;
-        const seen = new Map([[startKey, { first: null, depth: 0 }]]);
-        const queue = [{ x: start.x, y: start.y }];
+        const prev = new Map([[startKey, null]]);
+        const queue = [{ x: start.x, y: start.y, key: startKey }];
 
         while (queue.length > 0) {
             const node = queue.shift();
-            const info = seen.get(`${node.x},${node.y}`);
             for (const dir of DIRS) {
                 const next = this.slide(maze, node.x, node.y, dir);
                 const nextKey = `${next.x},${next.y}`;
-                if (seen.has(nextKey)) continue;
-                const step = { first: info.first || dir, depth: info.depth + 1 };
-                if (nextKey === goal) return { dir: step.first, moves: step.depth };
-                seen.set(nextKey, step);
-                queue.push(next);
+                if (prev.has(nextKey)) continue;
+                prev.set(nextKey, { from: node.key, dir });
+                if (nextKey === goal) {
+                    const path = [];
+                    for (let step = prev.get(nextKey); step; step = prev.get(step.from)) path.unshift(step.dir);
+                    return { dir: path[0], moves: path.length, path };
+                }
+                queue.push({ x: next.x, y: next.y, key: nextKey });
             }
         }
         return null;
@@ -1056,11 +1281,26 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     }
 
     /**
-     * Walkable tile on the side for `dir` closest to `origin` (the player, like
-     * RuneLite's hint arrow, so it walks as little as possible). Corners are
-     * excluded.
+     * Stand tile for a solution's first grab, within spell range of the
+     * guardian. Looks one grab ahead: along the side it prefers the end nearest
+     * the side the following grab needs, so a U-turn (north, west, south) runs
+     * down the west side toward the south while the guardian slides. A cast
+     * goes off from wherever the player is on the side once the guardian stops,
+     * so a long slide means a long run and a short slide a short one.
      */
-    mazeStandTile(maze, dir, origin) {
+    pickStandTile(maze, solution, player, guardian) {
+        const g = { x: guardian.x, y: guardian.y, plane: maze.plane };
+        return this.mazeStandTile(maze, solution.dir, player, { toward: solution.path[1] || null, rangeFrom: g })
+            || this.mazeStandTile(maze, solution.dir, g);
+    }
+
+    /**
+     * Walkable tile on the side for `dir`, never a corner. With `toward` (a
+     * perpendicular direction) the end of the side nearest that way wins;
+     * otherwise, and as a tie-break, the tile closest to `origin` (the player,
+     * like RuneLite's hint arrow). `rangeFrom` limits it to spell range of that tile.
+     */
+    mazeStandTile(maze, dir, origin, { toward = null, rangeFrom = null } = {}) {
         const base = this.teleSideOffset.value;
         const vertical = dir.dy !== 0;
         const along = vertical
@@ -1073,14 +1313,17 @@ class MageTrainingArenaPlugin extends titan.Plugin {
 
         const positions = [];
         for (let v = along.min; v <= along.max; v++) positions.push(v);
-        positions.sort((a, b) => Math.abs(a - along.origin) - Math.abs(b - along.origin));
+        const pull = toward ? (vertical ? toward.dx : toward.dy) : 0;
+        const goal = pull > 0 ? along.max : pull < 0 ? along.min : null;
+        const cost = (v) => (goal === null ? 0 : Math.abs(v - goal));
+        positions.sort((a, b) => cost(a) - cost(b) || Math.abs(a - along.origin) - Math.abs(b - along.origin));
 
         for (let offset = base; offset <= base + 2; offset++) {
             const across = edge + outward * offset;
             for (const v of positions) {
-                const x = vertical ? v : across;
-                const y = vertical ? across : v;
-                if (this.isWalkable(maze.plane, x, y)) return { x, y, plane: maze.plane };
+                const tile = { x: vertical ? v : across, y: vertical ? across : v, plane: maze.plane };
+                if (rangeFrom && chebyshev(tile, rangeFrom) > 10) continue;
+                if (this.isWalkable(maze.plane, tile.x, tile.y)) return tile;
             }
         }
         return null;
@@ -1096,76 +1339,189 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     }
 
     // ---- Alchemists' Playground --------------------------------------------
+    /**
+     * Wiki strategy: one Search reveals the layout, then Take-5 from the best
+     * item's cupboard. A reserve of each item type is kept so a price rotation
+     * never leaves nothing to alch; items are only dropped to make room for
+     * the next take. Alching doesn't interrupt walking, searching or taking,
+     * so it runs every cooldown alongside whatever the cupboard step is doing.
+     */
     tickAlchemist() {
         const a = this.alch;
         this.readAlchTable();
         this.refreshCupboards();
-        this.resolveCupboardSearch();
+        const counts = this.alchItemCounts();
+        this.resolveCupboardSearch(counts);
+        a.lastCounts = counts;
+        a.droppedSlot = -1;
 
-        const inv = titan.utils.inventory;
-        const coins = inv.count(ITEM.MTA_COINS);
-        if (coins >= this.alchDepositAt.value) {
-            this.depositAlchemyCoins();
-            return;
+        const coins = titan.utils.inventory.count(ITEM.MTA_COINS);
+        if (coins >= this.alchDepositAt.value) this.depositAlchemyCoins();
+        else this.alchCupboardStep(counts, coins);
+        if (this.running) this.alchAlongside(counts);
+    }
+
+    /** Cast on the next item if the spell is off cooldown, on top of the tick's other action. */
+    alchAlongside(counts) {
+        const a = this.alch;
+        if (this.tick - a.lastAlchTick < ALCH_COOLDOWN_TICKS) return;
+        const item = this.nextAlchItem(counts, a.droppedSlot);
+        if (!item) return;
+        const doing = this.status;
+        if (this.action(`Alch ${item.name}`, item.castOn(this.alchemySpell()))) {
+            this.session.casts++;
+            a.lastAlchTick = this.tick;
+            this.status = `${doing} + alching ${item.name}`;
         }
+    }
 
-        const held = this.heldAlchItems();
-        const junk = held.find((item) => {
-            const value = this.alchValue(item.id);
-            return value >= 0 && value < this.alchMinValue.value;
-        });
-        if (junk) {
-            this.status = `Dropping ${junk.name}`;
-            this.action(`Drop ${junk.name}`, junk.interact("Drop"));
-            this.wait(0, 1);
-            return;
-        }
-
-        // Alch between searches, but never while a search result is pending:
-        // alching then would hide the item the search added.
-        if (held.length > 0 && !a.pendingSearch && this.tick - a.lastAlchTick >= ALCH_COOLDOWN_TICKS) {
-            const item = held.sort((l, r) => this.alchValue(r.id) - this.alchValue(l.id))[0];
-            this.status = `Alching ${item.name} (${this.alchValue(item.id)} coins)`;
-            if (this.action(`Alch ${item.name}`, item.castOn(this.alchemySpell()))) {
-                this.session.casts++;
-                a.lastAlchTick = this.tick;
-                this.wait(0, 1);
-            }
-            return;
-        }
-
+    /** Search to learn the layout, Take-5 the best item, or top up the reserve. */
+    alchCupboardStep(counts, coins) {
+        const a = this.alch;
         if (a.pendingSearch) {
-            this.status = "Searching cupboard";
+            this.retryCupboardClick(a.pendingSearch);
             return;
         }
 
+        // Layout unknown (start, or a price rotation): one Search of the nearest cupboard reveals it.
+        if (!a.anchor) {
+            const nearest = this.pickCupboard();
+            if (!nearest) {
+                this.status = "No cupboards found";
+                this.walkFallback(COORDS.roomCenters[ROOM.ALCHEMIST]);
+                this.wait(2, 3);
+                return;
+            }
+            this.status = "Searching a cupboard for the layout";
+            this.clickCupboard(nearest, null, "Search");
+            return;
+        }
+        if (a.best < 0) {
+            this.status = "Reading prices";
+            return;
+        }
+
+        const reserve = this.alchReserve.value | 0;
+        if (counts[a.best] <= reserve) {
+            this.takeFromCupboard(a.best, true, counts, coins);
+            return;
+        }
+        // Top up the reserve (one at a time) while there are best items to alch on the way.
+        const short = [0, 1, 2, 3, 4].filter((item) => item !== a.best && counts[item] < reserve);
+        if (short.length > 0) {
+            const player = this.local();
+            const dist = (item) => {
+                const target = this.cupboardFor(item);
+                return target && player ? player.distanceTo(target.obj.tile) : 99;
+            };
+            this.takeFromCupboard(short.sort((l, r) => dist(l) - dist(r))[0], false, counts, coins);
+            return;
+        }
+        this.status = `${counts[a.best]} ${ALCH_ITEM_NAMES[a.best]} left`;
+    }
+
+    /**
+     * Highest-value item worth alching now: any of the best item (reserve
+     * included, that's what it's for), or a spare above the reserve worth at
+     * least the minimum.
+     */
+    nextAlchItem(counts, skipSlot = -1) {
+        const a = this.alch;
+        const reserve = this.alchReserve.value | 0;
         const bestValue = a.best >= 0 ? a.costs[a.best] : -1;
-        const bestHeld = held.filter((item) => this.alchValue(item.id) === bestValue).length;
-        if (held.length > 0 && bestHeld >= this.alchHoldCount.value) {
-            this.status = "Waiting for alch cooldown";
-            return;
-        }
-        if (inv.emptySlots === 0) {
-            if (coins > 0) this.depositAlchemyCoins();
-            else this.stop("Inventory full - free some slots for alchemy items", {
-                why: "Every slot is taken and there are no coins to deposit, so no cupboard item can be taken.",
-                fix: "Free a few inventory slots and start again.",
-            });
-            return;
-        }
+        const alchable = this.heldAlchItems().filter((item) => {
+            if (item.slot === skipSlot) return false;
+            const idx = ITEM.ALCH_ITEMS.indexOf(item.id);
+            const value = this.alchValue(item.id);
+            if (value < 0) return false;
+            if (value === bestValue) return true;
+            return counts[idx] > reserve && value >= this.alchMinValue.value;
+        });
+        return alchable.sort((l, r) => this.alchValue(r.id) - this.alchValue(l.id))[0] || null;
+    }
 
-        const target = this.pickCupboard();
+    /** Take the best item 5 at a time, or one to top up the reserve; drops a spare first if short of room. */
+    takeFromCupboard(item, many, counts, coins) {
+        const a = this.alch;
+        const inv = titan.utils.inventory;
+        const target = this.cupboardFor(item);
         if (!target) {
-            this.status = "No cupboards found";
-            this.walkFallback(COORDS.roomCenters[ROOM.ALCHEMIST]);
-            this.wait(2, 3);
+            a.anchor = null;    // layout no longer matches; search again
             return;
         }
+        if (item === a.best) a.bestCupboard = target.key;
 
-        this.status = a.bestCupboard === target.key ? "Taking the best item" : "Exploring cupboards";
-        if (this.interactPreferred(target.obj, ["Search"])) {
-            a.pendingSearch = { key: target.key, tick: this.tick, snapshot: this.alchItemCounts() };
+        if (inv.emptySlots < (many ? 5 : 1)) {
+            const spare = this.spareAlchItem(counts, item);
+            if (spare) {
+                this.status = `Dropping ${spare.name} for room`;
+                this.action(`Drop ${spare.name}`, spare.interact("Drop"));
+                a.droppedSlot = spare.slot;     // so this tick's alch doesn't pick the same item
+                return;
+            }
+            if (inv.emptySlots === 0) {
+                if (coins > 0) this.depositAlchemyCoins();
+                else this.stop("Inventory full - free some slots for alchemy items", {
+                    why: "Every slot is taken, nothing is spare above the reserve, and there are no coins to deposit.",
+                    fix: "Free a few inventory slots or lower 'Reserve of each item', then start again.",
+                });
+                return;
+            }
         }
+        this.status = many ? `Taking 5 ${ALCH_ITEM_NAMES[item]}` : `Topping up ${ALCH_ITEM_NAMES[item]}`;
+        this.clickCupboard(target, item, many ? this.takeManyAction(target.obj) : "Search");
+    }
+
+    /** Lowest-value item above the reserve that isn't `keep` or the best item, or null. */
+    spareAlchItem(counts, keep) {
+        const a = this.alch;
+        const reserve = this.alchReserve.value | 0;
+        return this.heldAlchItems()
+            .filter((item) => {
+                const idx = ITEM.ALCH_ITEMS.indexOf(item.id);
+                return idx !== keep && idx !== a.best && counts[idx] > reserve;
+            })
+            .sort((l, r) => this.alchValue(l.id) - this.alchValue(r.id))[0] || null;
+    }
+
+    /** The cupboard's take-many option (Take-5), falling back to Search when it has none. */
+    takeManyAction(obj) {
+        const actions = (obj.actions || []).filter((action) => action);
+        if (actions.length === 0) return "Take-5";
+        return actions.find((action) => /take/i.test(action)) || "Search";
+    }
+
+    clickCupboard(target, item, action) {
+        if (this.interactPreferred(target.obj, [action])) {
+            this.alch.pendingSearch = { key: target.key, item, action, tick: this.tick, start: this.tick };
+        }
+    }
+
+    /**
+     * Waiting on a cupboard click. At the cupboard with no answer after 3
+     * ticks, the result was missed (a take and an alch of the same item in one
+     * tick cancel out in the counts), so drop the wait and go again; stopped
+     * short of it, click it again.
+     */
+    retryCupboardClick(search) {
+        const a = this.alch;
+        const obj = a.cupboards.get(search.key);
+        const player = this.local();
+        this.status = search.action === "Search" ? "Searching cupboard" : `${search.action} from cupboard`;
+        if (!obj || !player || !player.isStationary || this.tick - search.tick < 3) return;
+        if (this.nextTo(obj)) {
+            a.pendingSearch = null;
+            return;
+        }
+        if (this.tick - search.tick >= 4 && this.interactPreferred(obj, [search.action])) search.tick = this.tick;
+    }
+
+    /** The cupboard holding `item` under the known layout, or null. */
+    cupboardFor(item) {
+        for (const [key, obj] of this.alch.cupboards) {
+            if (this.predictCupboard(this.cupboardIndex(obj)) === item) return { key, obj };
+        }
+        return null;
     }
 
     alchemySpell() {
@@ -1244,17 +1600,18 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         this.alch.cupboards = found;
     }
 
-    resolveCupboardSearch() {
+    resolveCupboardSearch(counts) {
         const a = this.alch;
         const search = a.pendingSearch;
         if (!search) return;
 
-        const counts = this.alchItemCounts();
-        const gained = counts.findIndex((count, idx) => count > search.snapshot[idx]);
+        // Alching only ever lowers counts, so any rise this tick is the cupboard's answer.
+        const prev = a.lastCounts || counts;
+        const gained = counts.findIndex((count, idx) => count > prev[idx]);
         let item;
         if (gained >= 0) item = gained;
-        else if (a.emptyTick >= search.tick) item = EMPTY_CUPBOARD;
-        else if (this.tick - search.tick > 12) {
+        else if (a.emptyTick >= search.start) item = EMPTY_CUPBOARD;
+        else if (this.tick - search.start > 20) {
             a.pendingSearch = null;
             return;
         } else return;
@@ -1284,20 +1641,11 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         return mod(anchor.item + idx - anchor.idx, NUM_CUPBOARDS);
     }
 
-    /** The cupboard holding the best item once the layout is known, else the nearest one. */
+    /** The nearest cupboard (to search when the layout is unknown). */
     pickCupboard() {
         const a = this.alch;
         const player = this.local();
         if (!player || a.cupboards.size === 0) return null;
-
-        if (a.best >= 0) {
-            for (const [key, obj] of a.cupboards) {
-                if (this.predictCupboard(this.cupboardIndex(obj)) === a.best) {
-                    a.bestCupboard = key;
-                    return { key, obj };
-                }
-            }
-        }
         a.bestCupboard = null;
 
         const nearest = Array.from(a.cupboards.entries())
@@ -1326,14 +1674,20 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             return;
         }
         e.bonus = this.readBonusShape();
+        this.countDragonstones();
+        if (this.enchantMode.value === ENCH_MODE.DRAGONSTONES) {
+            this.tickDragonstones(spell);
+            return;
+        }
 
         if (this.enchantDragonstones.value && inv.emptySlots > 0) {
             const dragonstone = titan.queries.groundItems(SCAN_RADIUS).id(ITEM.DRAGONSTONE).nearest();
             if (dragonstone) {
                 this.status = "Picking up a dragonstone";
-                if (!this.inProgress("dragonstone", inv.size, 4)) {
+                const key = `dragonstone:${dragonstone.tileX},${dragonstone.tileY}`;
+                if (!this.walkingTo(key)) {
                     this.action("Take dragonstone", dragonstone.interact("Take"));
-                    this.track("dragonstone", inv.size);
+                    this.track(key, inv.size);
                 }
                 return;
             }
@@ -1357,19 +1711,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             if (enchantable.length === 0) {
                 e.phase = orbs > 0 ? "deposit" : "collect";
             } else {
-                const slotStillHolds = titan.queries.inventory().slot(e.castSlot).id(e.castItem).any();
-                if (this.awaiting("enchant", !slotStillHolds, 5)) {
-                    this.status = "Enchanting";
-                    return;
-                }
-                const next = this.nextEnchantTarget(enchantable, e.bonus);
-                this.status = `Enchanting ${next.name}`;
-                if (this.action(`${spell.name || "Enchant"} on ${next.name}`, next.castOn(spell))) {
-                    this.session.casts++;
-                    e.castSlot = next.slot;
-                    e.castItem = next.id;
-                    this.track("enchant", next.slot);
-                }
+                this.enchantNext(spell, enchantable);
                 return;
             }
         }
@@ -1392,10 +1734,240 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             return;
         }
         this.status = `Taking ${this.pileShape(pile) || "shapes"}`;
+        // Standing directly next to the pile, a click takes shapes every tick, so
+        // click every tick. Anywhere else, click once and let the run finish.
         const pileKey = `collect:${pile.tileX},${pile.tileY}`;
-        if (!this.inProgress(pileKey, inv.size, 4)) {
-            if (this.interactPreferred(pile, ["Take-from", "Take"])) this.track(pileKey, inv.size);
+        if (!this.nextTo(pile) && this.walkingTo(pileKey)) return;
+        if (this.interactPreferred(pile, ["Take-from", "Take"])) this.track(pileKey, inv.size);
+    }
+
+    /** Cast the enchant on the next held item, waiting for the last cast to land first. */
+    enchantNext(spell, enchantable) {
+        const e = this.ench;
+        const slotStillHolds = titan.queries.inventory().slot(e.castSlot).id(e.castItem).any();
+        if (this.awaiting("enchant", !slotStillHolds, 5)) {
+            this.status = "Enchanting";
+            return;
         }
+        const next = this.nextEnchantTarget(enchantable, e.bonus);
+        this.status = `Enchanting ${next.name}`;
+        if (this.action(`${spell.name || "Enchant"} on ${next.name}`, next.castOn(spell))) {
+            this.session.casts++;
+            e.castSlot = next.slot;
+            e.castItem = next.id;
+            this.track("enchant", next.slot);
+        }
+    }
+
+    /** Session count of dragonstones picked up (from the floor or the shape piles). */
+    countDragonstones() {
+        const e = this.ench;
+        const held = titan.utils.inventory.count(ITEM.DRAGONSTONE);
+        if (e.stones !== null && held > e.stones) this.session.dragonstones += held - e.stones;
+        e.stones = held;
+    }
+
+    /**
+     * Dragonstone mode (wiki: Enchanting Chamber). Take every dragonstone
+     * lying in the room in one sweep around it, enchanting a held one while
+     * running to the next, then enchant the rest and hop worlds for fresh
+     * spawns instead of waiting for the slow respawn. Orbs are deposited only
+     * when the inventory is full.
+     */
+    tickDragonstones(spell) {
+        const e = this.ench;
+        const inv = titan.utils.inventory;
+        const held = titan.queries.inventory().ids(...ENCHANTABLE).toArray();
+        const ground = inv.emptySlots > 0 ? this.nextSweepStone() : null;
+
+        if (ground) {
+            const key = `dragonstone:${ground.tileX},${ground.tileY}`;
+            if (!this.walkingTo(key)) {
+                this.status = "Picking up a dragonstone";
+                if (this.action("Take dragonstone", ground.interact("Take"))) this.track(key, inv.size);
+                return;
+            }
+            this.status = "Running to a dragonstone";
+            // Enchant one on the way (spells are 3 ticks apart); this doesn't stop the run.
+            if (held.length > 0 && this.tick - e.runCastTick >= 3) {
+                const next = this.nextEnchantTarget(held, e.bonus);
+                if (this.action(`${spell.name || "Enchant"} on ${next.name} (running)`, next.castOn(spell))) {
+                    this.session.casts++;
+                    e.runCastTick = this.tick;
+                }
+            }
+            return;
+        }
+
+        if (held.length > 0) {
+            this.enchantNext(spell, held);
+            return;
+        }
+        if (inv.emptySlots === 0 && inv.count(ITEM.ORB) > 0) {
+            this.depositOrbs();
+            return;
+        }
+        this.hopForDragonstones();
+    }
+
+    /**
+     * The next dragonstone going round the room like a player would: start at
+     * the nearest spawn with a stone, head whichever way round the ring reaches
+     * the next stone in fewer spawns, then keep that direction for the rest of
+     * this world. The current target is kept until it's picked up. A stone off
+     * the ring (unexpected) is taken last, nearest first.
+     */
+    nextSweepStone() {
+        const e = this.ench;
+        const stones = titan.queries.groundItems(SCAN_RADIUS).id(ITEM.DRAGONSTONE).toArray();
+        if (stones.length === 0) return null;
+        const wp = (stone) => stone.worldPoint;
+        const sweep = e.sweep;
+        if (sweep && sweep.target) {
+            const target = stones.find((stone) => wp(stone).x === sweep.target.x && wp(stone).y === sweep.target.y);
+            if (target) return target;
+            if (sweep.target.index >= 0) sweep.index = sweep.target.index;   // picked up: carry on from there
+            sweep.target = null;
+        }
+
+        const player = this.local();
+        const byDistance = (l, r) => (player ? player.distanceTo(l.tile) - player.distanceTo(r.tile) : 0);
+        const onRing = stones.filter((stone) => this.ringIndex(wp(stone)) >= 0);
+        let next;
+        if (onRing.length === 0) {
+            next = stones.sort(byDistance)[0];
+            if (!e.sweep) e.sweep = { dir: 0, index: -1, target: null };
+        } else if (!sweep || sweep.index < 0) {
+            next = onRing.sort(byDistance)[0];
+            e.sweep = { dir: 0, index: this.ringIndex(wp(next)), target: null };
+        } else {
+            const n = DRAGONSTONE_RING.length;
+            // Spawns to walk past going `dir`; a stone back on the current spot counts as a full lap.
+            const steps = (stone, dir) => mod(dir * (this.ringIndex(wp(stone)) - sweep.index), n) || n;
+            const closest = (dir) => onRing.slice().sort((l, r) => steps(l, dir) - steps(r, dir) || byDistance(l, r))[0];
+            if (sweep.dir === 0) {
+                const cw = closest(1);
+                const ccw = closest(-1);
+                const diff = steps(cw, 1) - steps(ccw, -1);
+                sweep.dir = diff < 0 || (diff === 0 && byDistance(cw, ccw) <= 0) ? 1 : -1;
+            }
+            next = closest(sweep.dir);
+        }
+        e.sweep.target = { x: wp(next).x, y: wp(next).y, index: this.ringIndex(wp(next)) };
+        return next;
+    }
+
+    /** Position of a world tile on DRAGONSTONE_RING (within a tile), or -1. */
+    ringIndex(point) {
+        return DRAGONSTONE_RING.findIndex((spot) => chebyshev(spot, point) <= 1);
+    }
+
+    hopForDragonstones() {
+        const minTicks = Math.ceil((this.hopMinSeconds.value | 0) / 0.6);
+        const wait = minTicks - (this.tick - this.lastHopTick);
+        if (wait > 0) {
+            this.status = `No dragonstones - hopping in ${formatTicks(wait)}`;
+            return;
+        }
+        const from = titan.state.world.current();
+        const to = this.nextHopWorld(from);
+        if (to === null) {
+            this.warnOnce("hop-none", "No world to hop to",
+                "No members world passed the filters (not PvP, high-risk, skill-total, beta or seasonal"
+                + (this.hopSameRegion.value ? ", same region" : "") + ").",
+                "Turn off 'Hop within my region', or check the world list has loaded.");
+            this.wait(5, 8);
+            return;
+        }
+        this.status = `Hopping to world ${to}`;
+        const ok = titan.state.world.hopIngame(to);
+        this.crumb(`Hop to world ${to}`, ok ? "action" : "fail");
+        if (ok) {
+            this.hopping = { from, to, tick: this.tick, arrived: -1 };
+            this.lastHopTick = this.tick;
+            this.hopFails = 0;
+            this.session.hops++;
+            if (from !== null) {
+                this.recentWorlds.push(from);
+                if (this.recentWorlds.length > RECENT_WORLDS) this.recentWorlds.shift();
+            }
+            return;
+        }
+        // Refused: skip this world for a while and try the next one.
+        this.badWorlds.set(to, this.tick + BAD_WORLD_TICKS);
+        this.hopFails++;
+        if (this.hopFails === HOP_FAIL_REPORT) this.reportHopFailure(to);
+        this.wait(2, 3);
+    }
+
+    /** Why hopIngame said no: it only accepts worlds in the client's own list, and not while busy. */
+    reportHopFailure(to) {
+        const world = titan.state.world;
+        const live = world.list() || [];
+        const info = (world.metadata() || []).find((w) => w.id === to);
+        const skipped = [...this.badWorlds.entries()].filter(([, until]) => until > this.tick).map(([id]) => id);
+        this.report("failing", "World hops keep failing",
+            `The client refused ${this.hopFails} hops in a row (last: world ${to}). It only accepts worlds in `
+            + `its own world list and not while a hop is still in progress. Client list: ${live.length} worlds, `
+            + `world ${to} ${live.some((w) => w.id === to) ? "is" : "is NOT"} in it`
+            + (info ? `; SLR says activity "${info.activity}", flags ${info.flags}.` : ".")
+            + ` Skipping for now: ${skipped.join(", ") || "none"}.`,
+            "It keeps trying other worlds on its own. If every hop fails, open the world switcher once "
+            + "(so the client loads its list) or hop by hand, then send this report.");
+    }
+
+    /**
+     * Next world after `current` by id: members, not PvP/high-risk/skill-total/
+     * beta/seasonal, online, not visited recently, and (by setting) in the same
+     * region. Null when none qualify.
+     */
+    nextHopWorld(current) {
+        const world = titan.state.world;
+        const meta = world.metadata() || [];
+        const worlds = meta.length > 0 ? meta : (world.list() || []);
+        const here = meta.find((w) => w.id === current);
+        const region = this.hopSameRegion.value && here ? here.region : null;
+        // hopIngame only accepts worlds in the client's own list, which can lag the SLR one.
+        const live = new Set((world.list() || []).map((w) => w.id));
+        const usable = worlds.filter((w) => w.isMembers && !w.isBeta
+            && (live.size === 0 || live.has(w.id))
+            && !(this.badWorlds.get(w.id) > this.tick)
+            && (w.flags & HOP_EXCLUDED_FLAGS) === 0
+            && !HOP_EXCLUDED_ACTIVITY.test(w.activity || "")
+            && (w.population === undefined || w.population >= 0)
+            && (!region || w.region === region)
+            && w.id !== current);
+        if (usable.length === 0) return null;
+        const fresh = usable.filter((w) => !this.recentWorlds.includes(w.id));
+        const pool = (fresh.length > 0 ? fresh : usable).sort((l, r) => l.id - r.id);
+        const next = pool.find((w) => current === null || w.id > current) || pool[0];
+        return next.id;
+    }
+
+    /** True while a world hop is in flight or the new world is still loading. */
+    waitForHop() {
+        const h = this.hopping;
+        const now = titan.state.world.current();
+        const arrived = now !== null ? now !== h.from : this.tick - h.tick >= 10;
+        if (arrived) {
+            if (h.arrived < 0) h.arrived = this.tick;
+            if (this.tick - h.arrived < HOP_SETTLE_TICKS) {
+                this.status = `World ${now === null ? h.to : now}: loading`;
+                return true;
+            }
+            this.event(`Hopped to world ${now === null ? h.to : now}`);
+            this.hopping = null;
+            this.pending = null;
+            if (this.ench) this.ench.sweep = null;
+            return false;
+        }
+        if (this.tick - h.tick > HOP_TIMEOUT_TICKS) {
+            this.crumb(`Hop to world ${h.to} timed out`, "fail");
+            this.hopping = null;
+            return false;
+        }
+        this.status = `Hopping to world ${h.to}`;
+        return true;
     }
 
     enchantSpell() {
@@ -1440,16 +2012,24 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         return shape ? shape.key : null;
     }
 
+    /**
+     * The pile to take from: the bonus shape's when "bonus only" is on, else
+     * the nearest. Once picked it's kept until the bonus shape changes, so
+     * running past other piles (or a one-tick unreadable bonus) never retargets.
+     */
     pickShapePile(bonus) {
+        const e = this.ench;
         const piles = titan.queries.objects(SCAN_RADIUS).ids(...OBJ.SHAPE_PILES).toArray();
         const player = this.local();
         if (piles.length === 0 || !player) return null;
+        const want = this.enchantBonusOnly.value && bonus ? bonus.key : null;
+        const locked = e.pileKey && piles.find((pile) => tileKey(pile.tile) === e.pileKey);
+        if (locked && (!want || this.pileShape(locked) === want)) return locked;
+
         piles.sort((l, r) => player.distanceTo(l.tile) - player.distanceTo(r.tile));
-        if (this.enchantBonusOnly.value && bonus) {
-            const bonusPile = piles.find((pile) => this.pileShape(pile) === bonus.key);
-            if (bonusPile) return bonusPile;
-        }
-        return piles[0];
+        const pile = (want && piles.find((candidate) => this.pileShape(candidate) === want)) || piles[0];
+        e.pileKey = tileKey(pile.tile);
+        return pile;
     }
 
     depositOrbs() {
@@ -1516,7 +2096,9 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             return;
         }
         this.status = `Grabbing bones (${fruitValue}/${target} fruit)`;
-        // A click loots a bone every tick, so click every tick until the threshold is reached.
+        // Running to the pile: click once and let the walk finish. Once the first bone
+        // lands, a click loots a bone every tick, so click every tick until the threshold.
+        if (bones.length === 0 && this.walkingTo("grab-bones")) return;
         if (this.interactPreferred(pile, ["Grab"])) this.track("grab-bones", bones.length);
     }
 
@@ -1710,6 +2292,31 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         return this.action(`Walk to ${point.x},${point.y}`, titan.state.walk.toWorld(point.x, point.y, point.z));
     }
 
+    /**
+     * True while the last click on `key` is still being walked to: the player
+     * is moving, or clicked under 2 ticks ago. Once idle again, click again.
+     */
+    walkingTo(key) {
+        const p = this.pending;
+        if (!p || p.key !== key) return false;
+        const player = this.local();
+        return (player && !player.isStationary) || this.tick - p.tick < 2;
+    }
+
+    /** True when the player stands still, directly (not diagonally) next to `obj`'s footprint. */
+    nextTo(obj) {
+        const player = this.local();
+        if (!player || !obj || !player.isStationary) return false;
+        const p = player.tile;
+        const w = Math.max(1, obj.sizeX | 0);
+        const h = Math.max(1, obj.sizeY | 0);
+        if (p.plane !== obj.plane) return false;
+        const alongX = p.x >= obj.tileX && p.x < obj.tileX + w;
+        const alongY = p.y >= obj.tileY && p.y < obj.tileY + h;
+        return (alongX && (p.y === obj.tileY - 1 || p.y === obj.tileY + h))
+            || (alongY && (p.x === obj.tileX - 1 || p.x === obj.tileX + w));
+    }
+
     /** Start tracking an action whose effect shows up as a change in `value`. */
     track(key, value) {
         this.pending = { key, value, tick: this.tick, lastChange: this.tick };
@@ -1780,7 +2387,123 @@ class MageTrainingArenaPlugin extends titan.Plugin {
     }
 
     goalFor(room) {
-        return this.goalSettings[room].value;
+        if (this.goalMode.value !== GOAL_MODE.GREEN_LOG) return this.goalSettings[room].value;
+        return this.missingRewards().reduce((sum, reward) => sum + reward.cost[room], 0);
+    }
+
+    // ---- Rewards / green log -------------------------------------------------
+    /** Rewards the green-log goal still needs, cheapest wand first. */
+    goalRewards() {
+        return REWARDS.filter((reward) => this.countsTowardGoal(reward));
+    }
+
+    countsTowardGoal(reward) {
+        return reward.log || (!!reward.optional && !!this[reward.optional].value);
+    }
+
+    missingRewards() {
+        return this.goalRewards().filter((reward) => !this.owned.has(reward.key));
+    }
+
+    /**
+     * Keep `owned` current: the Bones to Peaches unlock varbit, any reward item
+     * in the inventory (a fresh purchase lands there), and the collection log's
+     * Magic Training Arena page while it's open (authoritative for its items).
+     */
+    trackRewards() {
+        let changed = false;
+        const add = (key) => {
+            if (this.owned.has(key)) return;
+            this.owned.add(key);
+            changed = true;
+            const reward = REWARDS.find((r) => r.key === key);
+            if (this.logRead || !reward.log) this.event(`${reward.name} owned - goal lowered`, COLOR.GOOD);
+        };
+        if (titan.state.vars.varbit(VARBIT_PEACHES_UNLOCKED) > 0) add("peaches");
+        titan.queries.inventory().ids(...REWARD_ITEMS).forEach((item) => {
+            const reward = REWARDS.find((r) => r.item === item.id);
+            if (reward) add(reward.key);
+        });
+        if (this.readCollectionLog()) changed = true;
+        if (changed) this.saveRewards();
+    }
+
+    /** Read owned items off the open collection log page; true when anything changed. */
+    readCollectionLog() {
+        if (!this.isWidgetVisible(WIDGET.CLOG_ITEMS)) return false;
+        const slots = titan.queries.widgets(WIDGET.CLOG_GROUP)
+            .where((w) => w.packedId === WIDGET.CLOG_ITEMS && w.dynamicChildSlot === -1)
+            .children()
+            .toArray();
+        const logged = REWARDS.filter((reward) => reward.log);
+        const found = logged.filter((reward) => slots.some((slot) => slot.itemId === reward.item));
+        if (found.length < 6) return false;     // some other page
+        let changed = !this.logRead;
+        this.logRead = true;
+        found.forEach((reward) => {
+            // Like RuneLite: obtained items are drawn at full opacity, missing ones faded.
+            const have = slots.some((slot) => slot.itemId === reward.item && slot.opacity === 0);
+            if (have === this.owned.has(reward.key)) return;
+            if (have) this.owned.add(reward.key);
+            else this.owned.delete(reward.key);
+            changed = true;
+        });
+        if (changed) {
+            const done = logged.filter((reward) => this.owned.has(reward.key)).length;
+            this.event(`Collection log read: ${done}/${logged.length} MTA items`, COLOR.GOOD);
+        }
+        return changed;
+    }
+
+    loadRewards() {
+        try {
+            const saved = JSON.parse(this.rewardsStore.value || "null");
+            if (saved && Array.isArray(saved.owned)) {
+                this.owned = new Set(saved.owned.filter((key) => REWARDS.some((r) => r.key === key)));
+                this.logRead = !!saved.logRead;
+            }
+        } catch (error) {
+            this.owned = new Set();
+            this.logRead = false;
+        }
+    }
+
+    saveRewards() {
+        this.rewardsStore.value = JSON.stringify({ owned: [...this.owned], logRead: this.logRead });
+    }
+
+    resetRewards() {
+        this.owned = new Set();
+        this.logRead = false;
+        this.saveRewards();
+        this.event("Forgot owned rewards - open the collection log to re-read them");
+    }
+
+    buildRewardsTab(panel) {
+        const green = this.goalMode.value === GOAL_MODE.GREEN_LOG;
+        panel.separatorText(green ? "Green log goal" : "Rewards (goal mode: Manual)");
+        if (!this.logRead) panel.label("Collection log", "not read - open its Magic Training Arena page");
+        panel.beginTable("mta_rewards", 3);
+        ["Reward", "Owned", "Cost (T / A / E / G)"].forEach((label) => panel.tableSetupColumn(label));
+        panel.tableHeadersRow();
+        REWARDS.forEach((reward) => {
+            const counted = this.countsTowardGoal(reward);
+            const cells = [
+                reward.name + (counted ? "" : " (not counted)"),
+                this.owned.has(reward.key) ? "Yes" : "-",
+                reward.cost.map((c) => c.toLocaleString()).join(" / "),
+            ];
+            panel.tableNextRow();
+            cells.forEach((cell) => {
+                panel.tableNextColumn();
+                panel.text(cell);
+            });
+        });
+        panel.endTable();
+        const missing = this.missingRewards();
+        const left = ROOMS.map((room) => missing.reduce((sum, r) => sum + r.cost[room], 0).toLocaleString());
+        panel.label("Still to buy", `${missing.length} (${left.join(" / ")} pts)`);
+        panel.spacing().button("Forget owned rewards", 7);
     }
 
     goalReached(room) {
@@ -1833,6 +2556,8 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             casts: 0,
             eaten: 0,
             dodges: 0,
+            dragonstones: 0,
+            hops: 0,
         };
     }
 
@@ -2033,6 +2758,12 @@ class MageTrainingArenaPlugin extends titan.Plugin {
                 line(`${marker}${ROOM_NAMES[r]}`, `${this.pointsLabel(r)} / ${this.goalFor(r).toLocaleString()}`,
                     done ? COLOR.GOOD : r === this.currentRoom ? COLOR.ACCENT : COLOR.TEXT);
             });
+            if (this.goalMode.value === GOAL_MODE.GREEN_LOG) {
+                const all = this.goalRewards();
+                const have = all.filter((reward) => this.owned.has(reward.key)).length;
+                line("Green log", this.logRead ? `${have} / ${all.length} owned` : "open collection log",
+                    this.logRead ? (have === all.length ? COLOR.GOOD : COLOR.TEXT) : COLOR.WARN);
+            }
             bar(this.totalProgress(), `${Math.floor(this.totalProgress() * 100)}% of all goals`, COLOR.GOOD);
         }
 
@@ -2063,6 +2794,8 @@ class MageTrainingArenaPlugin extends titan.Plugin {
                 line("Best item", a.best >= 0 ? `${ALCH_ITEM_NAMES[a.best]} (${bestValue})` : "Reading prices");
                 line("Best cupboard", a.bestCupboard ? "Known" : "Searching (1 search reveals all)",
                     a.bestCupboard ? COLOR.GOOD : COLOR.WARN);
+                const held = this.alchItemCounts();
+                line("Held", ALCH_ITEM_NAMES.map((name, i) => `${name.slice(0, 4)} ${held[i]}`).join("  "));
                 line("Coins held", `${inv.count(ITEM.MTA_COINS).toLocaleString()} / ${this.alchDepositAt.value.toLocaleString()}`);
                 line("Coins deposited", this.session.deposited[ROOM.ALCHEMIST].toLocaleString());
                 break;
@@ -2070,9 +2803,17 @@ class MageTrainingArenaPlugin extends titan.Plugin {
             case ROOM.ENCHANTING: {
                 const e = this.ench;
                 title("Enchanting");
-                line("Bonus shape", e.bonus ? capitalize(e.bonus.key) : "Unknown", e.bonus ? COLOR.GOOD : COLOR.DIM);
+                const stoneMode = this.enchantMode.value === ENCH_MODE.DRAGONSTONES;
+                line("Mode", stoneMode ? "Dragonstones + hop" : "Shapes");
                 const shapes = titan.queries.inventory().ids(...ENCHANTABLE).count();
-                line("Phase", `${capitalize(e.phase)}  (${shapes} to enchant)`);
+                if (stoneMode) {
+                    const world = titan.state.world.current();
+                    line("Dragonstones", `${this.session.dragonstones} taken, ${shapes} to enchant`);
+                    line("World hops", `${this.session.hops}${world === null ? "" : `  (now w${world})`}`);
+                } else {
+                    line("Bonus shape", e.bonus ? capitalize(e.bonus.key) : "Unknown", e.bonus ? COLOR.GOOD : COLOR.DIM);
+                    line("Phase", `${capitalize(e.phase)}  (${shapes} to enchant)`);
+                }
                 line("Spell", e.spell ? e.spell.name : this.enchantLevel.value > 0 ? `Lvl-${this.enchantLevel.value} Enchant` : "-");
                 line("Orbs", `${inv.count(ITEM.ORB)} held, ${this.session.deposited[ROOM.ENCHANTING].toLocaleString()} deposited`);
                 break;
@@ -2144,6 +2885,10 @@ class MageTrainingArenaPlugin extends titan.Plugin {
 
         panel.beginTabItem("Rooms");
         this.buildRoomsTable(panel);
+        panel.endTabItem();
+
+        panel.beginTabItem("Rewards");
+        this.buildRewardsTab(panel);
         panel.endTabItem();
 
         // Only exists once something has gone wrong.
@@ -2494,6 +3239,7 @@ class MageTrainingArenaPlugin extends titan.Plugin {
         if (actionId === 1) this.toggleAutomation();
         else if (actionId === 2) this.resetTrackedPoints();
         else if (actionId === 3) this.resetSession();
+        else if (actionId === 7) this.resetRewards();
         else if (actionId === 4 && this.reports[0]) this.dismissedReport = this.reports[0].id;
         else if (actionId === 5 && this.reports[0]) this.writeReportToLog(this.reports[0]);
         else if (actionId === 6) {

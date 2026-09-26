@@ -33,17 +33,26 @@ Set up the inventory and equipment for the room before starting.
 
 | Room | Needs | Loop |
 | --- | --- | --- |
-| Telekinetic | Law runes, air (or air staff) | Solves the maze by breadth-first search over statue slides, stands on the matching side, casts Telekinetic Grab, and starts a new maze when it's solved. |
-| Alchemist | Nature runes, fire (or fire staff) | Reads the price table, searches one cupboard to learn the layout (the 6 cupboards cycle through the items by object id, as in RuneLite's MTA plugin), takes the 30-coin item, alchs it, drops items below the minimum value, and deposits coins. |
-| Enchanting | Cosmic runes plus the staff/runes for the spell | Fills the inventory from the bonus-shape pile, picks up dragonstones, enchants everything, and deposits orbs. |
-| Graveyard | Nature runes, earth/water (or mud staff), food | Sticks to the bone pile nearest the food chute and clicks it every tick. Peaches stops once the bones are worth 24 (the 3-point cap); Bananas fills the inventory. It tracks the pile's 4-bones-per-type rotation so it knows whether the next bone still fits. It then casts, deposits, dodges falling bones, and eats only below the HP threshold. |
+| Telekinetic | Law runes, air (or air staff) | If the guardian is out of view, walks to the nearest maze wall to find it. Solves the maze by breadth-first search over statue slides, stands on the matching side, and casts Telekinetic Grab. While the guardian slides, it runs ahead to the side for the next grab and casts again as soon as the guardian stops. It looks one grab ahead to pick where to run: on a U-turn (north, west, south) it heads for the south end of the west side, so a long slide means a long run and a short slide a short one. It starts a new maze when one is solved. |
+| Alchemist | Nature runes, fire (or fire staff) | Reads the price table and searches one cupboard to learn the layout (the 6 cupboards cycle through the items by object id, as in RuneLite's MTA plugin). Then it takes the 30-coin item 5 at a time with the cupboard's Take-5 option, alching on every cooldown, including while walking. It keeps a reserve of each item (2 by default) so it can keep alching after a price change while it walks to the new cupboard. It only drops spare items to make room for the next take, and deposits coins. |
+| Enchanting | Cosmic runes plus the staff/runes for the spell | **Shapes mode:** fills the inventory from the bonus-shape pile, picks up dragonstones, enchants everything, and deposits orbs. **Dragonstones + world hop mode:** takes every dragonstone in the room (double points) in one sweep around the orb hole, clockwise or anticlockwise, whichever way the second stone is. It enchants a held one while running to the next, then enchants the rest and hops to another members world. Orbs are deposited only when the inventory is full. It skips PvP, high-risk, skill-total, beta and seasonal worlds, and optionally stays in your region. |
+| Graveyard | Nature runes, earth/water (or mud staff), food | Sticks to the bone pile nearest the food chute. It clicks once to run there, then every tick once the first bone lands. Peaches stops once the bones are worth 24 (the 3-point cap); Bananas fills the inventory. It tracks the pile's 4-bones-per-type rotation so it knows whether the next bone still fits. It then casts, deposits, dodges falling bones, and eats only below the HP threshold. |
 
 **Auto** mode stays in a room until its goal is met, then moves to the room
 furthest from its goal. The inventory must hold the supplies for every room.
 
 Points are read from the room HUD and the lobby overview and persisted between
-sessions. Lower the per-room goals under *Point goals* if you've already bought
-some rewards.
+sessions. *Point goals → Goal mode* picks how the goals are set:
+
+- **Manual:** the four per-room goals (defaults are every reward).
+- **Green log:** each room's goal is what the rewards you don't own yet still
+  cost. Buying one lowers the goal by as much as your points drop, so progress
+  doesn't go backwards. Ownership comes from the collection log's Magic Training
+  Arena page (open it once; the plugin reads it whenever it's open) and from
+  reward items seen in the inventory. The rune pouch and Bones to Peaches aren't
+  on the log, so each has its own opt-in; Bones to Peaches is detected from its
+  unlock varbit. The side panel's **Rewards** tab lists every reward, whether
+  you own it, and its cost.
 
 ## HUD
 
@@ -57,11 +66,13 @@ The in-game overlay panel (Alt-drag to move) shows:
   (with that room's XP/h), and time to goal. Points/h only counts time spent
   inside that room, so walking and Auto-mode room swaps don't skew it.
 - **Room details:** maze next grab and grabs to finish; alchemy best item,
-  cupboard search progress and coins; enchanting bonus shape, phase, spell and
+  cupboard search progress and coins; enchanting mode, bonus shape, phase (or
+  dragonstones taken and world hops), spell and
   orbs; graveyard HP, spell, bones/fruit, next bone from the pile, food eaten
   and bones dodged. Also the room's rune
   count and cast count.
-- **Goals:** all four rooms against their goals, and **Last progress**, which
+- **Goals:** all four rooms against their goals (plus green-log items owned in
+  Green log mode), and **Last progress**, which
   turns yellow or red if points and XP stop going up.
 - **Recent:** the last few notable events (0 hides them).
 
@@ -104,12 +115,15 @@ These are built from the SDK typings and the wiki, not yet tested against the
 live client:
 
 - **Action names:** `Enter` (portals), `New-maze`/`Reset` (guardian), `Search`
-  (cupboards), `Take-from` (shape piles), `Grab` (bone piles), `Deposit`. If an
+  and `Take-5` (cupboards; any option containing "take" is used), `Take-from` (shape piles), `Grab` (bone piles), `Deposit`. If an
   action is missing, the log lists the actions the object actually has.
 - **Maze walls:** the solver assumes the maze walls (object 10755) set collision
   flags, as RuneLite's MTA plugin does.
 - **Stand distance:** the plugin stands on the outer wall line, where RuneLite
   marks the cast tiles, never on a corner. This is adjustable in settings.
+- **World hopping:** uses `titan.state.world.hopIngame`, with world flags as RuneLite's
+  WorldType bits. The plugin waits for the world id to change, plus 3 ticks for
+  ground items to load, before looking for dragonstones.
 - **Enchanting bonus:** the bonus shape is read as the only visible HUD shape
   icon.
 - **Cupboard order:** follows RuneLite. Slot n (from the object id) holds the
